@@ -87,7 +87,7 @@
 #align(center)[
   #text(size: 9pt, fill: gray)[
     Companion to `SPEC.md` (design & milestones). This document defines the
-    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2].
+    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2, M3].
   ]
 ]
 
@@ -191,6 +191,8 @@ requester and echoed by the responder in every related datagram.
   [SEGMENT_CONTENTS], [—], [#strong[✓] transfer], [#strong[✓] index], [#strong[✓] N], [file chunk ≤ 1400 B],
   [SEGMENT_NOT_FOUND], [—], [#strong[✓] transfer], [—], [—], [—],
   [ACK], [#strong[✓] type], [#strong[✓] transfer], [—], [—], [next range (start, count) — see §6],
+  [PEERLIST_REQUEST], [—], [—], [—], [—], [—],
+  [PEERLIST_RESPONSE], [—], [—], [—], [—], [packed ip:port entries (6 B each)],
 )
 
 = Message catalog
@@ -214,8 +216,8 @@ requester and echoed by the responder in every related datagram.
   [#hexcode[0x31]], [SEGMENT_CONTENTS], [any → any], [spec'd (M2)], [file chunk ≤ 1400 B],
   [#hexcode[0x32]], [SEGMENT_NOT_FOUND], [any → any], [spec'd (M2)], [—],
   [#hexcode[0x40]], [ACK], [any → any], [spec'd (M2)], [next range (start, count)],
-  [#hexcode[0x50]], [PEERLIST_REQUEST], [peer → master], [planned], [—],
-  [#hexcode[0x51]], [PEERLIST_RESPONSE], [master → peer], [planned], [packed ip:port entries],
+  [#hexcode[0x50]], [PEERLIST_REQUEST], [peer → any], [done (M3)], [—],
+  [#hexcode[0x51]], [PEERLIST_RESPONSE], [any → peer], [done (M3)], [packed ip:port entries],
 )
 
 = Manifest request (happy path)
@@ -345,6 +347,33 @@ peer's current range does not fill within the quiet period, it re-sends the
 same #mono[ACK] (retransmit request). If the master's ack timer fires it
 re-sends its last range — the peer deduplicates, so blind re-sends are safe.
 Both sides give up after #mono[8] retries.
+
+= Peer discovery (M3)
+
+The bootstrap node doubles as the list source. Peers poll it for
+`PEERLIST_RESPONSE` (packed 6-byte entries: 4-byte IPv4 octets + 2-byte
+big-endian port), then handshake with each new peer — handshakes are
+mutual, so two peers that discover each other converge immediately.
+
+== Exchange
+
+#seqdiagram(
+  (("peer2", 0), ("peer1", 1), ("master", 2)),
+  (
+    (0, 2, [PEERLIST_REQUEST], "req"),
+    (2, 0, [PEERLIST_RESPONSE  ·  peer1], "resp"),
+    (0, 1, [HANDSHAKE_REQUEST], "req"),
+    (1, 0, [HANDSHAKE_RESPONSE], "resp"),
+    (0, 1, [SEGMENT_REQUEST  ·  any segment], "req"),
+    (1, 0, [SEGMENT_CONTENTS  ·  …, ACKs…], "data"),
+  ),
+)
+
+#v(6pt)
+The peerlist reply contains only the responder's own view, excluding the
+requester. Entries the requester already knows (registered via an incoming
+handshake, for example) are skipped. The transfer in the last two steps
+needs no handshake — serving is stateless.
 
 = Appendix: transfer settings
 

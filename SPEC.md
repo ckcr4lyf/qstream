@@ -3,7 +3,7 @@
 > Modern Rust rewrite of the `udp-file-transfer` P2P video streaming design.
 > Single static binary, no runtime dependencies. `std`-only for now.
 >
-> Status: **v0.3 — M0 (handshake), M1 (manifest), M2 (segment transfer) implemented.**
+> Status: **v0.4 — M0 (handshake), M1 (manifest), M2 (segments), M3 (peer discovery) implemented.**
 
 ---
 
@@ -116,8 +116,8 @@ spec: 3-byte magic instead of 4, no reserved byte.)
 | SEGMENT_CONTENTS     | 0x31 | any → any        | file chunk (≤1400 bytes)          | ✅ done M2 |
 | SEGMENT_NOT_FOUND    | 0x32 | any → any        | —                                 | ✅ done M2 |
 | ACK                  | 0x40 | any → any        | next range (u16 start, u16 count) or empty + `COMPLETE` flag | ✅ done M2 |
-| PEERLIST_REQUEST     | 0x50 | peer → master    | —                              | ⏳ planned  |
-| PEERLIST_RESPONSE    | 0x51 | master → peer    | packed (ip:port) entries       | ⏳ planned  |
+| PEERLIST_REQUEST     | 0x50 | peer → any        | —                                 | ✅ done M3 |
+| PEERLIST_RESPONSE    | 0x51 | any → peer        | packed (ip:port) entries          | ✅ done M3 |
 
 ### 5.3 Handshake flow (M0)
 
@@ -167,14 +167,42 @@ Packetization: a file of size S yields `N = max(1, ceil(S / 1400))` packets;
 all but the last are exactly 1400 bytes. An empty file yields one packet with
 a zero-length payload. Datagram size ≤ 14 + 1400 = 1414 bytes (MTU-safe).
 
+### 5.6 Peer discovery (M3)
+
+Discovery is rendezvous-style: the node you bootstrapped from is also your
+list source, and transfers between peers are stateless (no handshake
+required to serve a segment).
+
+1. Every peer polls its bootstrap node for `PEERLIST_REQUEST` every
+   `PEERLIST_POLL_INTERVAL_MS = 5000`.
+2. The responder replies `PEERLIST_RESPONSE` with **its own view** of peers
+   (handshaked + discovered), packed as 6-byte entries
+   (4-byte IPv4 octets + 2-byte big-endian port), excluding the requester.
+3. For each new peer, the requester sends `HANDSHAKE_REQUEST` (3 s timeout).
+   - Success ⇒ register in the peer registry (with name) — usable for pulls.
+   - Timeout ⇒ skip; retried on the next list.
+4. Handshakes are **mutual**: any handshake we receive also registers the
+   sender, so two peers that discover each other converge immediately
+   (peerlist dedup by `SocketAddr`).
+
+Peer registry:
+- Entries are learned from handshakes (sent or received) and peerlists.
+- Idle entries are evicted after `PEER_TTL_MS = 600000` (10 min).
+- A peer that never answers a download is evicted immediately on job
+  failure (see §7.6).
+
+Segment availability is **trial-based**: we don't track which peer has which
+segment; a failed request (`SEGMENT_NOT_FOUND` or timeout) just means "try
+the next peer".
+
 ## 6. Node states
 
 ```
 master:  Listening ──► Serving (handshake, manifest + segment requests until Ctrl-C)
 
 peer:    Idle ──► Handshaking ──► Synced ──► ManifestSync ──► SegmentSync
-         (poll manifest,          (download missing segments, serve own copy)
-         write local copy)
+         (poll manifest,          (download missing segments in parallel,
+         write local copy)         discover peers via peerlists, serve own copy)
 ```
 
 ## 7. Reliability & flow control (M2)
@@ -255,6 +283,10 @@ ack timeout:
 | `ACK_RETRY_LIMIT`           | 8     | sender resend limit                    |
 | `MAX_CONCURRENT_TRANSFERS`  | 16    | per-node transfer registry bound       |
 | `COMPLETE_GRACE_MS`         | 2000  | keep done transfers to re-ACK COMPLETE |
+| `PEERLIST_POLL_INTERVAL_MS` | 5000  | peer asks bootstrap for the peer list  |
+| `PEER_TTL_MS`               | 600000| evict idle peers from the registry     |
+| `MAX_PARALLEL_DOWNLOADS`    | 4     | concurrent segment downloads           |
+| `MAX_INFLIGHT_PER_PEER`     | 2     | concurrent pulls per peer              |
 
 Pacing is the throughput limiter: 1 packet/ms ≈ 11 Mbps ceiling, ample for a
 1 Mbps HLS stream. Env overrides: `QSTREAM_PACING_MS`, `QSTREAM_QUIET_MS`.
@@ -270,6 +302,22 @@ manifest) are handled inline.
 The transfer registry is bounded (`MAX_CONCURRENT_TRANSFERS`); failed,
 complete and timed-out transfers are evicted. Filenames are validated to
 reject path traversal (no `/`, `\`, leading `.`, control characters).
+
+### 7.6 Job queue & peer selection (M3)
+
+Missing segments from the manifest become jobs in a queue. The peer runs up
+to `MAX_PARALLEL_DOWNLOADS` downloads concurrently, one receiver per job:
+
+- **Peer selection:** peers with the fewest in-flight transfers to us,
+  never a peer that already failed this job; pseudo-random tiebreak for
+  load spreading; bootstrap is just another (well-populated) peer.
+- **Retry:** a failed job (timeout / `SEGMENT_NOT_FOUND`) is retried with
+  another untried peer; when all peers are exhausted the job rests in a
+  `FAIL_RETRY_COOLDOWN_MS = 5000` cooldown before the next manifest sync
+  re-queues it.
+- **Dead-peer eviction:** a receiver that never gets a first response
+  removes that peer from the registry immediately (rather than waiting out
+  the TTL), so dead peers stop occupying download slots.
 
 ## 8. CLI
 
@@ -294,7 +342,7 @@ qstream --help
 | M0 | Scaffold + UDP handshake (this spec, §5.3)       | ✅     |
 | M1 | Manifest exchange (poll + serve)                 | ✅     |
 | M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | ✅     |
-| M3 | Peer discovery (PEERLIST) + job queue            | ⏳     |
+| M3 | Peer discovery (PEERLIST) + job queue            | ✅     |
 | M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ⏳     |
 | M5 | Robustness: retransmission, timeouts, fault tests| ⏳     |
 
@@ -307,7 +355,12 @@ qstream --help
 - **Integration:** master + peer on loopback; assert handshake outcome,
   peer list contents, and that the peer's synced manifest tracks the
   master's rolling playlist (sequence numbers advance in lockstep); a
-  requested segment arrives byte-identical to the master's file.
+  requested segment arrives byte-identical.
+- **Discovery (M3):** master + 2-3 peers on loopback — peers discover each
+  other via peerlists + mutual handshakes, pull from multiple sources, and
+  keep byte-identical data dirs; chain bootstrap (peer2 → peer1 → master)
+  works; killing a peer mid-transfer triggers retry via remaining peers
+  and eviction of the unresponsive peer.
 - **Fault injection (M2+):** test harness that drops/duplicates/reorders
   packets via an env var, to validate window/retry logic.
 - **E2E (M4+):** ffmpeg-generated HLS → master → 2 peers → `ffplay` playback

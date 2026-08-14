@@ -201,6 +201,7 @@ pub struct ReceiverTransfer {
     quiet_deadline: Instant,
     deadline: Instant,
     outcome: Option<Result<(), String>>,
+    unresponsive: bool,
     started_at: Instant,
 }
 
@@ -225,6 +226,7 @@ impl ReceiverTransfer {
             quiet_deadline: now + quiet_period(),
             deadline: now + quiet_period(),
             outcome: None,
+            unresponsive: false,
             started_at: now,
         }
     }
@@ -244,6 +246,16 @@ impl ReceiverTransfer {
         ));
         self.outcome = Some(Err(reason));
         self.deadline = Instant::now() + COMPLETE_GRACE;
+    }
+
+    /// Fail because the peer never answered — the peer may be dead.
+    pub fn fail_unresponsive(&mut self, reason: String) {
+        self.unresponsive = true;
+        self.fail(reason);
+    }
+
+    pub fn unresponsive(&self) -> bool {
+        self.unresponsive
     }
 
     fn recompute_deadline(&mut self) {
@@ -414,7 +426,10 @@ impl ReceiverTransfer {
         }
 
         if now >= self.first_response_deadline && self.packets.is_empty() {
-            self.fail(format!("no response from {} for {}", self.remote, self.filename));
+            self.fail_unresponsive(format!(
+                "no response from {} for {}",
+                self.remote, self.filename
+            ));
             return;
         }
 
@@ -616,11 +631,9 @@ impl TransferRegistry {
         self.receivers.get(&id).and_then(ReceiverTransfer::outcome)
     }
 
-    pub fn receiver_filename(&self, id: u16) -> String {
-        self.receivers
-            .get(&id)
-            .map(|r| r.filename.clone())
-            .unwrap_or_default()
+    /// Whether the receiver failed because its peer never answered.
+    pub fn receiver_unresponsive(&self, id: u16) -> bool {
+        self.receivers.get(&id).map(ReceiverTransfer::unresponsive).unwrap_or(false)
     }
 
     pub fn remove_receiver(&mut self, id: u16) {

@@ -4,6 +4,7 @@
 //! All integers are big-endian (network byte order). See PROTOCOL.pdf §3.
 
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub const MAGIC: [u8; 3] = *b"QST";
 pub const PROTOCOL_VERSION: u8 = 0x02;
@@ -18,9 +19,11 @@ pub enum MessageType {
     ManifestResponse = 0x21,
     SegmentRequest = 0x30,
     SegmentContents = 0x31,
-    SegmentNotFound = 0x32,
-    Ack = 0x40,
-}
+            SegmentNotFound = 0x32,
+            Ack = 0x40,
+            PeerlistRequest = 0x50,
+            PeerlistResponse = 0x51,
+        }
 
 impl MessageType {
     pub fn from_u8(code: u8) -> Option<MessageType> {
@@ -33,6 +36,8 @@ impl MessageType {
             0x31 => Some(Self::SegmentContents),
             0x32 => Some(Self::SegmentNotFound),
             0x40 => Some(Self::Ack),
+            0x50 => Some(Self::PeerlistRequest),
+            0x51 => Some(Self::PeerlistResponse),
             _ => None,
         }
     }
@@ -89,6 +94,10 @@ pub enum Message {
         next_start: u16,
         next_count: u16,
     },
+    /// PEERLIST_REQUEST — no payload.
+    PeerlistRequest,
+    /// PEERLIST_RESPONSE — payload: packed (ip:port) entries, 6 bytes each.
+    PeerlistResponse { peers: Vec<SocketAddr> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +118,8 @@ pub enum ProtocolError {
     BadAckFlags { got: u8 },
     /// Progress ACK payload must be exactly 4 bytes.
     BadAckPayload { len: usize },
+    /// Peerlist payload length must be a multiple of 6 bytes.
+    BadPeerlistPayload { len: usize },
 }
 
 impl fmt::Display for ProtocolError {
@@ -135,6 +146,9 @@ impl fmt::Display for ProtocolError {
             }
             ProtocolError::BadAckPayload { len } => {
                 write!(f, "progress ACK payload must be 4 bytes, got {len}")
+            }
+            ProtocolError::BadPeerlistPayload { len } => {
+                write!(f, "peerlist payload must be a multiple of 6 bytes, got {len}")
             }
         }
     }
@@ -173,6 +187,8 @@ pub fn encode(message: &Message) -> Vec<u8> {
                 ack_type,
                 ..
             } => (MessageType::Ack, *ack_type as u8, *transfer_id, 0, 0),
+            Message::PeerlistRequest => (MessageType::PeerlistRequest, 0, 0, 0, 0),
+            Message::PeerlistResponse { .. } => (MessageType::PeerlistResponse, 0, 0, 0, 0),
         };
 
     let payload: Vec<u8> = match message {
@@ -199,6 +215,8 @@ pub fn encode(message: &Message) -> Vec<u8> {
                 Vec::new()
             }
         }
+        Message::PeerlistRequest => Vec::new(),
+        Message::PeerlistResponse { peers } => encode_peers(peers),
     };
 
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
@@ -291,7 +309,39 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
                 }
             }
         }
+        MessageType::PeerlistRequest => Message::PeerlistRequest,
+        MessageType::PeerlistResponse => Message::PeerlistResponse {
+            peers: decode_peers(payload)?,
+        },
     })
+}
+
+/// Pack peer addresses: 4-byte IPv4 octets + 2-byte big-endian port, per entry.
+fn encode_peers(peers: &[SocketAddr]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(peers.len() * 6);
+    for peer in peers {
+        if let SocketAddr::V4(v4) = peer {
+            payload.extend_from_slice(&v4.ip().octets());
+            payload.extend_from_slice(&v4.port().to_be_bytes());
+        }
+    }
+    payload
+}
+
+/// Decode packed peer entries; skips malformed ones (port 0, IPv6).
+fn decode_peers(payload: &[u8]) -> Result<Vec<SocketAddr>, ProtocolError> {
+    if payload.len() % 6 != 0 {
+        return Err(ProtocolError::BadPeerlistPayload { len: payload.len() });
+    }
+    let mut peers = Vec::new();
+    for chunk in payload.chunks_exact(6) {
+        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+        if port != 0 {
+            peers.push(SocketAddr::new(IpAddr::V4(ip), port));
+        }
+    }
+    Ok(peers)
 }
 
 fn utf8_name(payload: &[u8]) -> Result<String, ProtocolError> {
@@ -372,6 +422,58 @@ mod tests {
             next_count: 0,
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_peerlist_request() {
+        let msg = Message::PeerlistRequest;
+        let datagram = encode(&msg);
+        assert_eq!(datagram.len(), HEADER_SIZE);
+        assert_eq!(decode(&datagram).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_peerlist_response() {
+        let msg = Message::PeerlistResponse {
+            peers: vec![
+                SocketAddr::from(([127, 0, 0, 1], 4444)),
+                SocketAddr::from(([10, 0, 0, 2], 5555)),
+            ],
+        };
+        assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn peerlist_response_wire_format() {
+        let msg = Message::PeerlistResponse {
+            peers: vec![
+                SocketAddr::from(([127, 0, 0, 1], 4444)),
+                SocketAddr::from(([10, 0, 0, 2], 5555)),
+            ],
+        };
+        let expected: Vec<u8> = vec![
+            0x51, 0x53, 0x54, 0x02, 0x51, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7F, 0x00, 0x00, 0x01, 0x11, 0x5C, // 127.0.0.1:4444
+            0x0A, 0x00, 0x00, 0x02, 0x15, 0xB3, // 10.0.0.2:5555
+        ];
+        assert_eq!(encode(&msg), expected);
+        assert_eq!(decode(&expected).unwrap(), msg);
+    }
+
+    #[test]
+    fn rejects_bad_peerlist_payload() {
+        let msg = Message::PeerlistResponse {
+            peers: vec![SocketAddr::from(([127, 0, 0, 1], 4444))],
+        };
+        let mut datagram = encode(&msg);
+        // Declare a 5-byte payload instead of 6.
+        datagram[6] = 0x00;
+        datagram[7] = 0x05;
+        datagram.truncate(HEADER_SIZE + 5);
+        assert!(matches!(
+            decode(&datagram),
+            Err(ProtocolError::BadPeerlistPayload { len: 5 })
+        ));
     }
 
     // ---- wire-format vectors matching PROTOCOL.pdf §5/§6 examples ----

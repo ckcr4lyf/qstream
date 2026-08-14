@@ -5,8 +5,7 @@ design: one master (seed) serves an HLS stream over plain UDP, peers download
 segments and re-serve them to each other. Single static binary, no runtime
 dependencies.
 
-**Status: Milestones M0 (handshake), M1 (manifest exchange) and M2 (segment
-transfer) implemented.** See [SPEC.md](SPEC.md) for the full design and
+**Status: Milestones M0–M3 implemented** (handshake, manifest, segment transfer, peer discovery + parallel job queue). See [SPEC.md](SPEC.md) for the full design and
 milestone plan.
 
 ## Build
@@ -32,9 +31,9 @@ local copy in the data dir):
 
 The peer logs `handshake OK`, then `manifest updated (N segments, M bytes)`
 as the live playlist rolls; its copy lands in `./data/live.m3u8` (use a
-custom dir: `qstream peer 4444 127.0.0.1 3333 /path/to/dir`). It then
-**pulls every missing segment** from the master into the data dir
-(`downloaded seg_XXXX.ts (N bytes, ...ms, ... KB/s)`).
+custom dir: `qstream peer 4444 127.0.0.1 3333 /path/to/dir`). It then **pulls every missing segment** — several in parallel, from the master
+*and* any peers it discovers via peerlists (`pulling seg_X from <addr>`,
+`downloaded seg_XXXX.ts (N bytes, ...ms, ... KB/s)`).
 
 ## Environment
 
