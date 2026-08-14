@@ -26,7 +26,7 @@ pub const RETRY_LIMIT: u32 = 8;
 /// Sender ack-timeout retries (with backoff, outlives the receiver's budget
 /// so a burst-stalled window can recover).
 pub const SENDER_RETRY_LIMIT: u32 = 30;
-pub const COMPLETE_GRACE: Duration = Duration::from_millis(2000);
+pub const COMPLETE_GRACE: Duration = Duration::from_millis(4000);
 pub const MAX_CONCURRENT_TRANSFERS: usize = 32;
 
 /// Tunables overridable via env (SPEC.md §7.4).

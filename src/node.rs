@@ -207,8 +207,10 @@ impl Node {
                 self.downloaded_total += 1;
             }
             PullResult::NotFound => {
+                // "Doesn't have it yet" is availability churn (everyone asks
+                // everyone for the newest segment), not bad service — count
+                // it but don't punish the score (M5).
                 stat.nf_pulls += 1;
-                stat.adjust(-1);
             }
             PullResult::Timeout => {
                 stat.timeouts += 1;
@@ -228,11 +230,10 @@ impl Node {
         match result {
             ServeResult::Served => {
                 stat.served += 1;
-                stat.adjust(1);
+                stat.adjust(2);
             }
             ServeResult::NotFound => {
                 stat.nf_served += 1;
-                stat.adjust(-1);
             }
             ServeResult::SenderFailed => {
                 stat.sender_fails += 1;

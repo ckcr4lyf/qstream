@@ -24,7 +24,12 @@ use crate::protocol::{self, Message};
 use crate::transfer;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-const MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Manifest poll base interval; each poll is staggered by 0..JITTER so
+/// peers don't see new segments in lockstep (M5 — synchronized polls make
+/// peer-to-peer pulls useless: everyone asks everyone for the newest
+/// segment before anyone has it).
+const MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_JITTER_MS: u64 = 1000;
 const MANIFEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const PEERLIST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_TTL: Duration = Duration::from_secs(600);
@@ -85,9 +90,7 @@ pub fn run(
     // --- protocol state ---
     let mut handshake_done = false;
     let mut next_handshake_retry = Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut next_poll = Instant::now();
     let mut poll_timeout: Option<Instant> = None;
-    let mut next_peerlist = Instant::now();
     let mut pending_handshakes: HashMap<SocketAddr, Instant> = HashMap::new();
 
     // --- job scheduler state ---
@@ -98,6 +101,12 @@ pub fn run(
     let mut failed_at: HashMap<String, Instant> = HashMap::new();
     let mut unresponsive_hits: HashMap<SocketAddr, u32> = HashMap::new();
     let mut rng = Rng::new(0);
+
+    // Stagger the very first polls too, so peers don't start in lockstep.
+    let stagger = Duration::from_millis(rng.next() % POLL_JITTER_MS);
+    let mut next_poll = Instant::now() + stagger;
+    let stagger = Duration::from_millis(rng.next() % (2 * POLL_JITTER_MS));
+    let mut next_peerlist = Instant::now() + stagger;
 
     // Initial handshake with the bootstrap node.
     let hs = Message::HandshakeRequest {
@@ -223,7 +232,8 @@ pub fn run(
             let req = Message::ManifestRequest;
             node.send(&protocol::encode(&req), remote);
             log::trace("sent MANIFEST_REQUEST");
-            next_poll = now + MANIFEST_POLL_INTERVAL;
+            let jitter = Duration::from_millis(rng.next() % POLL_JITTER_MS);
+            next_poll = now + MANIFEST_POLL_INTERVAL + jitter;
             poll_timeout = Some(now + MANIFEST_RESPONSE_TIMEOUT);
         }
         if let Some(t) = poll_timeout {
@@ -237,7 +247,8 @@ pub fn run(
             let req = Message::PeerlistRequest;
             node.send(&protocol::encode(&req), remote);
             log::trace("sent PEERLIST_REQUEST");
-            next_peerlist = now + PEERLIST_POLL_INTERVAL;
+            let jitter = Duration::from_millis(rng.next() % (2 * POLL_JITTER_MS));
+            next_peerlist = now + PEERLIST_POLL_INTERVAL + jitter;
         }
 
         schedule_jobs(
@@ -294,7 +305,12 @@ fn schedule_jobs(
     };
     for (id, job, outcome, unresponsive, not_found, latency) in finished {
         active.remove(&id);
-        node.registry.remove_receiver(id);
+        if outcome.is_ok() {
+            // Let the registry keep the receiver in grace (COMPLETE_GRACE)
+            // to re-ACK a lost final ACK; it removes the receiver itself.
+        } else {
+            node.registry.remove_receiver(id);
+        }
         let result = if outcome.is_ok() {
             PullResult::Ok
         } else if unresponsive {
@@ -311,6 +327,9 @@ fn schedule_jobs(
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);
                 unresponsive_hits.remove(&job.peer);
+                // Keep the receiver in the registry for its grace period so
+                // it can re-ACK COMPLETE to a sender whose final ACK was
+                // lost (M5); the registry removes it after COMPLETE_GRACE.
             }
             _ => {
                 log::warn(&format!("segment {} pull failed: {}", job.filename, outcome.unwrap_err()));

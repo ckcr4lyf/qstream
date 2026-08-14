@@ -77,6 +77,20 @@ def master_seg_mtimes(start_ts):
     return mtimes
 
 
+def success_by_source(data):
+    """For each saved segment, the source of the LAST pull attempt before
+    its download — that's the peer that actually served it."""
+    by_file = {}
+    for ts, name, src in data["pulls"]:
+        by_file[name] = (ts, src)
+    counts = {}
+    for ts, name, *_ in data["downloads"]:
+        if name in by_file:
+            src = by_file[name][1]
+            counts[src] = counts.get(src, 0) + 1
+    return counts
+
+
 def lag_stats(downloads, mtimes, start_ts):
     """Replication lag: peer download time - master file mtime (ms)."""
     lags = []
@@ -131,6 +145,8 @@ def main():
         data = parse_log(path)
         saved = len(data["downloads"])
         pulls = len(data["pulls"])
+        ok_src = success_by_source(data)
+        ok_dist = " ".join(f"{k.split(':')[1]}:{v}" for k, v in sorted(ok_src.items(), key=lambda x: -x[1])[:4])
         src = {}
         for _, _, s in data["pulls"]:
             src[s] = src.get(s, 0) + 1
@@ -149,6 +165,7 @@ def main():
         xm_s = str(int(statistics.median(xms))) if xms else "-"
         cov_s = f"{cov}/{covn}" if cov is not None else "-"
         print(f"p{i}     {saved:>3}   {pulls:>4}  {src_dist:<28} {nf:>2}  {to:>2}  {inc:>3}  {other:>3}  {evicts:>3}  {kb_s:>7}  {xm_s:>9}  {lag_s:<19}  {cov_s}")
+        print(f"        ok-by-src: {ok_dist}")
         if data["ranks"]:
             print(f"        last ranking: {data['ranks'][-1][1]}")
 
