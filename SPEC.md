@@ -82,25 +82,25 @@ fix the original's window-desync flaw (see §7) with receiver-driven windows.
 All integers are **big-endian** (network byte order). Every datagram is one
 message: fixed header + optional payload.
 
-### 5.1 Header (16 bytes)
+### 5.1 Header (14 bytes)
 
-| Offset | Size | Field         | Notes                                        |
-|--------|------|---------------|----------------------------------------------|
-| 0      | 4    | magic         | ASCII `QSTR` (`0x51 0x53 0x54 0x52`)        |
-| 4      | 1    | version       | protocol version, currently `0x02`          |
-| 5      | 1    | message type  | see §5.2                                     |
-| 6      | 1    | flags         | ACK type for ACK messages, else `0x00`      |
-| 7      | 1    | reserved      | `0x00`; ignore on read                       |
-| 8      | 2    | data length   | payload length in bytes (0..=65535)         |
-| 10     | 2    | transfer id   | transfer correlation; `0x0000` if unused    |
-| 12     | 2    | packet number | 1-based packet index within a transfer      |
-| 14     | 2    | total packets | total packets in a transfer                 |
+| Offset | Size | Field         | Notes                             |
+|--------|------|---------------|-----------------------------------|
+| 0      | 3    | magic         | ASCII `QST` (`0x51 0x53 0x54`)   |
+| 3      | 1    | version       | protocol version, currently `0x02`|
+| 4      | 1    | message type  | see §5.2                           |
+| 5      | 1    | flags         | ACK type for ACK messages, else `0x00` |
+| 6      | 2    | data length   | payload length in bytes (0..=65535) |
+| 8      | 2    | transfer id   | transfer correlation; `0x0000` if unused |
+| 10     | 2    | packet number | 1-based packet index within a transfer |
+| 12     | 2    | total packets | total packets in a transfer        |
 
 Datagrams whose magic/version don't match are dropped and logged.
 
-Header v2 (16 B) extends v1 (8 B) with `flags`, `reserved`, `transfer id`,
-`packet number` and `total packets` — needed to multiplex concurrent
-segments on one socket and to route packets of a transfer.
+Header v2 (14 B) extends v1 (8 B) with `flags`, `transfer id`, `packet
+number` and `total packets` — needed to multiplex concurrent segments on one
+socket and to route packets of a transfer. (v2 was trimmed from 16 B during
+spec: 3-byte magic instead of 4, no reserved byte.)
 
 ### 5.2 Message catalog
 
@@ -165,7 +165,7 @@ Messages:
 
 Packetization: a file of size S yields `N = max(1, ceil(S / 1400))` packets;
 all but the last are exactly 1400 bytes. An empty file yields one packet with
-a zero-length payload. Datagram size ≤ 16 + 1400 = 1416 bytes (MTU-safe).
+a zero-length payload. Datagram size ≤ 14 + 1400 = 1414 bytes (MTU-safe).
 
 ## 6. Node states
 

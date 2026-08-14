@@ -1,3 +1,6 @@
 /target
 /live/
 /data/
+
+# generated artifacts
+/page-*.png

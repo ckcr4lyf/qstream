@@ -47,3 +47,7 @@ cargo test
 ```
 
 Unit tests cover the wire-protocol codec (round-trips, malformed datagrams).
+
+## Protocol document
+
+The wire protocol is documented in [PROTOCOL.pdf](PROTOCOL.pdf) (source: `PROTOCOL.typ`, regenerate with `typst compile PROTOCOL.typ PROTOCOL.pdf`).
