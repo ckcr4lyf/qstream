@@ -3,7 +3,7 @@
 > Modern Rust rewrite of the `udp-file-transfer` P2P video streaming design.
 > Single static binary, no runtime dependencies. `std`-only for now.
 >
-> Status: **v0.4 — M0 (handshake), M1 (manifest), M2 (segments), M3 (peer discovery) implemented.**
+> Status: **v0.5 — M0 (handshake), M1 (manifest), M2 (segments), M3 (peer discovery), M4 (playback) implemented.**
 
 ---
 
@@ -198,11 +198,13 @@ the next peer".
 ## 6. Node states
 
 ```
-master:  Listening ──► Serving (handshake, manifest + segment requests until Ctrl-C)
+master:  Listening ──► Serving (handshake, manifest + segment requests,
+         HTTP playback until Ctrl-C)
 
 peer:    Idle ──► Handshaking ──► Synced ──► ManifestSync ──► SegmentSync
          (poll manifest,          (download missing segments in parallel,
-         write local copy)         discover peers via peerlists, serve own copy)
+         write local copy)         discover peers via peerlists, serve own
+                                   copy over UDP + HTTP)
 ```
 
 ## 7. Reliability & flow control (M2)
@@ -322,8 +324,8 @@ to `MAX_PARALLEL_DOWNLOADS` downloads concurrently, one receiver per job:
 ## 8. CLI
 
 ```
-qstream server <port> <manifest-path>                        # master/seed mode
-qstream peer <local-port> <remote-ip> <remote-port> [data-dir]       # peer mode
+qstream server <port> <manifest-path> [http-port]                       # master/seed mode
+qstream peer <local-port> <remote-ip> <remote-port> [data-dir] [http-port]       # peer mode
 qstream --help
 ```
 
@@ -333,6 +335,9 @@ qstream --help
 - `peer <local-port> ...` binds `0.0.0.0:<local-port>` so peers can later be
   reached by other peers on a known port. `[data-dir]` defaults to `./data`;
   the synced manifest is written to `<data-dir>/live.m3u8`.
+- `[http-port]` (both modes, optional) starts the embedded HTTP server
+  (M4, §11) serving the node's directory — point an HLS player at it:
+  `ffplay http://127.0.0.1:<http-port>/live.m3u8 -live_start_index 0`.
 - `QSTREAM_LOG=error|warn|info|debug|trace` controls verbosity (default info).
 
 ## 9. Milestones
@@ -343,10 +348,34 @@ qstream --help
 | M1 | Manifest exchange (poll + serve)                 | ✅     |
 | M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | ✅     |
 | M3 | Peer discovery (PEERLIST) + job queue            | ✅     |
-| M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ⏳     |
+| M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ✅     |
 | M5 | Robustness: retransmission, timeouts, fault tests| ⏳     |
 
-## 10. Testing strategy
+## 10. Playback (M4)
+
+Playback is **out-of-band**: it uses plain HTTP, not the UDP protocol.
+Each node embeds a minimal std-only HTTP/1.1 static server (GET/HEAD,
+`Connection: close`, no ranges — just enough for a live HLS player) that
+serves its directory:
+
+- `GET /live.m3u8` — the manifest (`application/vnd.apple.mpegurl`)
+- `GET /seg_NNNN.ts` — segments (`video/mp2t`)
+
+The peer's directory fills in as segments are pulled, so a player pointed
+at the peer watches the same stream, replicated over UDP. Security: only
+flat, validated filenames are served — no path traversal, no directory
+listing.
+
+Play with:
+
+```
+ffplay http://127.0.0.1:<http-port>/live.m3u8 -live_start_index 0
+```
+
+A `[http-port]` argument on both modes enables it. Future work: HTTP range
+requests (for seeking), request logging at info level.
+
+## 11. Testing strategy
 
 - **Unit:** codec round-trips (encode/decode every message), malformed
   header rejection (bad magic/version/truncation), length edge cases;
@@ -361,6 +390,10 @@ qstream --help
   keep byte-identical data dirs; chain bootstrap (peer2 → peer1 → master)
   works; killing a peer mid-transfer triggers retry via remaining peers
   and eviction of the unresponsive peer.
+- **Playback (M4):** each node's embedded HTTP server serves the manifest
+  with the right MIME type and byte-identical segments; `ffprobe` and
+  `ffplay` consume the playlist from master and peer; 404 for missing
+  files, 405 for non-GET, traversal attempts rejected.
 - **Fault injection (M2+):** test harness that drops/duplicates/reorders
   packets via an env var, to validate window/retry logic.
 - **E2E (M4+):** ffmpeg-generated HLS → master → 2 peers → `ffplay` playback

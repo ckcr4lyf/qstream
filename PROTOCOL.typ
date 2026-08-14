@@ -87,7 +87,7 @@
 #align(center)[
   #text(size: 9pt, fill: gray)[
     Companion to `SPEC.md` (design & milestones). This document defines the
-    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2, M3].
+    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2, M3, M4].
   ]
 ]
 
@@ -106,10 +106,13 @@ beyond "send a datagram" is defined here. This document specifies:
 - the fixed #emph[datagram header] (section 3),
 - the #emph[message catalog] (section 4),
 - the #emph[manifest request] happy path (section 5),
-- the #emph[piece (segment) request] happy path (section 6).
+- the #emph[piece (segment) request] happy path (section 6),
+- #emph[peer discovery] (section 7),
+- the #emph[ACK / flow control] fields (throughout).
 
-The flow-control and retransmission rules are described in `SPEC.md` §7;
-only the wire formats are fixed here.
+Playback (M4) is deliberately out-of-band: each node also serves its
+directory over plain HTTP for HLS players — that is not part of this
+protocol.
 
 = Conventions
 

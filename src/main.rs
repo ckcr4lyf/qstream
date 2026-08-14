@@ -1,5 +1,6 @@
 //! qstream — P2P live video streaming over UDP. See SPEC.md.
 
+mod http;
 mod log;
 mod node;
 mod peer;
@@ -14,13 +15,15 @@ const USAGE: &str = "\
 qstream — P2P live video streaming over UDP (see SPEC.md)
 
 USAGE:
-    qstream server <port> <manifest-path>                      Master/seed mode
-    qstream peer <local-port> <remote-ip> <remote-port> [data-dir]   Peer mode
-    qstream --help                                             Show this help
+    qstream server <port> <manifest-path> [http-port]                       Master/seed mode
+    qstream peer <local-port> <remote-ip> <remote-port> [data-dir] [http-port]   Peer mode
+    qstream --help                                                          Show this help
 
 EXAMPLES:
-    qstream server 3333 live/live.m3u8
-    qstream peer 4444 127.0.0.1 3333
+    qstream server 3333 live/live.m3u8 8080
+    qstream peer 4444 127.0.0.1 3333 ./data 8081
+
+Play the stream: ffplay http://127.0.0.1:8080/live.m3u8 -live_start_index 0
 
 Env:
     QSTREAM_NAME  node name sent in handshake (default \"master\" / \"peer\")
@@ -53,8 +56,16 @@ fn main() -> ExitCode {
                 eprintln!("server: invalid port: {port_str}");
                 return ExitCode::FAILURE;
             };
+            let http_port = args
+                .get(3)
+                .map(|s| parse_port(s))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("server: {e}");
+                    std::process::exit(1);
+                });
             let name = node_name("master");
-            match server::run(port, manifest_path, &name) {
+            match server::run(port, manifest_path, &name, http_port) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("server error: {e}");
@@ -94,8 +105,16 @@ fn main() -> ExitCode {
 
             let remote = SocketAddr::new(remote_ip, remote_port);
             let data_dir = args.get(4).map(|s| s.as_str()).unwrap_or("./data");
+            let http_port = args
+                .get(5)
+                .map(|s| parse_port(s))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("peer: {e}");
+                    std::process::exit(1);
+                });
             let name = node_name("peer");
-            match peer::run(local_port, remote, &name, data_dir) {
+            match peer::run(local_port, remote, &name, data_dir, http_port) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("peer error: {e}");
@@ -113,4 +132,8 @@ fn main() -> ExitCode {
 
 fn node_name(default: &str) -> String {
     std::env::var("QSTREAM_NAME").unwrap_or_else(|_| default.to_string())
+}
+
+fn parse_port(s: &str) -> Result<u16, String> {
+    s.parse::<u16>().map_err(|_| format!("invalid http port: {s}"))
 }

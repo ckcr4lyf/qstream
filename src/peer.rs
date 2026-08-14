@@ -8,8 +8,10 @@ use std::fs;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::http;
 use crate::log;
 use crate::node::{Event, Node};
 use crate::protocol::{self, Message};
@@ -33,7 +35,13 @@ struct ActiveJob {
     peer: SocketAddr,
 }
 
-pub fn run(local_port: u16, remote: SocketAddr, name: &str, data_dir: &str) -> io::Result<()> {
+pub fn run(
+    local_port: u16,
+    remote: SocketAddr,
+    name: &str,
+    data_dir: &str,
+    http_port: Option<u16>,
+) -> io::Result<()> {
     let data_dir = PathBuf::from(data_dir);
     fs::create_dir_all(&data_dir)?;
 
@@ -43,6 +51,16 @@ pub fn run(local_port: u16, remote: SocketAddr, name: &str, data_dir: &str) -> i
         "peer listening on 0.0.0.0:{local_port} (name: {name}, data dir: {})",
         data_dir.display()
     ));
+
+    if let Some(hp) = http_port {
+        let root = data_dir.clone();
+        thread::spawn(move || {
+            if let Err(e) = http::serve(root, hp) {
+                log::error(&format!("http server failed: {e}"));
+                std::process::exit(1);
+            }
+        });
+    }
 
     let mut node = Node::new(
         socket,

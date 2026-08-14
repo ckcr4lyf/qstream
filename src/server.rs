@@ -1,15 +1,23 @@
 //! Master (seed) mode (SPEC.md §6): serve manifest + segments over one UDP
-//! socket until interrupted.
+//! socket until interrupted. Optionally also serves the stream over HTTP
+//! for playback (M4).
 
 use std::io;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::http;
 use crate::log;
 use crate::node::Node;
 
-pub fn run(port: u16, manifest_path: &str, name: &str) -> io::Result<()> {
+pub fn run(
+    port: u16,
+    manifest_path: &str,
+    name: &str,
+    http_port: Option<u16>,
+) -> io::Result<()> {
     let manifest_path = PathBuf::from(manifest_path);
     if !manifest_path.is_file() {
         log::error(&format!(
@@ -27,6 +35,16 @@ pub fn run(port: u16, manifest_path: &str, name: &str) -> io::Result<()> {
     log::info(&format!("master listening on 0.0.0.0:{port} (name: {name})"));
     log::info(&format!("serving manifest from {}", manifest_path.display()));
     log::info(&format!("serving segments from {}", segment_root.display()));
+
+    if let Some(hp) = http_port {
+        let root = segment_root.clone();
+        thread::spawn(move || {
+            if let Err(e) = http::serve(root, hp) {
+                log::error(&format!("http server failed: {e}"));
+                std::process::exit(1);
+            }
+        });
+    }
 
     let mut node = Node::new(socket, name.to_string(), manifest_path, segment_root);
     let mut buf = [0u8; 65536];

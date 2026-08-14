@@ -5,7 +5,7 @@ design: one master (seed) serves an HLS stream over plain UDP, peers download
 segments and re-serve them to each other. Single static binary, no runtime
 dependencies.
 
-**Status: Milestones M0–M3 implemented** (handshake, manifest, segment transfer, peer discovery + parallel job queue). See [SPEC.md](SPEC.md) for the full design and
+**Status: Milestones M0–M4 implemented** (handshake, manifest, segment transfer, peer discovery + parallel job queue, HTTP playback). See [SPEC.md](SPEC.md) for the full design and
 milestone plan.
 
 ## Build
@@ -16,17 +16,23 @@ cargo build --release
 
 ## Run
 
-Terminal 1 — master (point it at a live HLS playlist):
+Terminal 1 — master (point it at a live HLS playlist, serve it over HTTP):
 
 ```
-./target/release/qstream server 3333 live/live.m3u8
+./target/release/qstream server 3333 live/live.m3u8 8080
 ```
 
-Terminal 2 — peer (handshakes, then polls the manifest every 3s and keeps a
-local copy in the data dir):
+Terminal 2 — peer (handshakes, syncs the manifest, pulls segments in
+parallel from the master and any discovered peers, serves over HTTP):
 
 ```
-./target/release/qstream peer 4444 127.0.0.1 3333
+./target/release/qstream peer 4444 127.0.0.1 3333 ./data 8081
+```
+
+Terminal 3 — watch the stream (from the peer — it's replicated over UDP):
+
+```
+ffplay http://127.0.0.1:8081/live.m3u8 -live_start_index 0
 ```
 
 The peer logs `handshake OK`, then `manifest updated (N segments, M bytes)`
