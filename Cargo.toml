@@ -1,0 +1,8 @@
+[package]
+name = "qstream"
+version = "0.1.0"
+edition = "2024"
+description = "P2P live video streaming over UDP — modern Rust rewrite of udp-file-transfer"
+license = "ISC"
+
+[dependencies]
