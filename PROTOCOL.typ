@@ -87,7 +87,7 @@
 #align(center)[
   #text(size: 9pt, fill: gray)[
     Companion to `SPEC.md` (design & milestones). This document defines the
-    on-the-wire format. Status: #text(fill: rgb("#b45309"))[Draft — M2 not yet implemented].
+    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2].
   ]
 ]
 

@@ -3,7 +3,7 @@
 > Modern Rust rewrite of the `udp-file-transfer` P2P video streaming design.
 > Single static binary, no runtime dependencies. `std`-only for now.
 >
-> Status: **v0.2 — M0 (handshake) + M1 (manifest) implemented; M2 (segment transfer) spec'd.**
+> Status: **v0.3 — M0 (handshake), M1 (manifest), M2 (segment transfer) implemented.**
 
 ---
 
@@ -112,10 +112,10 @@ spec: 3-byte magic instead of 4, no reserved byte.)
 | PONG                 | 0x11 | any → any        | —                              | ⏳ planned  |
 | MANIFEST_REQUEST     | 0x20 | peer → master    | —                              | ✅ done M1 |
 | MANIFEST_RESPONSE    | 0x21 | master → peer    | m3u8 contents (raw bytes)      | ✅ done M1 |
-| SEGMENT_REQUEST      | 0x30 | any → any        | filename (UTF-8)                  | 📝 spec'd M2 |
-| SEGMENT_CONTENTS     | 0x31 | any → any        | file chunk (≤1400 bytes)          | 📝 spec'd M2 |
-| SEGMENT_NOT_FOUND    | 0x32 | any → any        | —                                 | 📝 spec'd M2 |
-| ACK                  | 0x40 | any → any        | next range (u16 start, u16 count) or empty + `COMPLETE` flag | 📝 spec'd M2 |
+| SEGMENT_REQUEST      | 0x30 | any → any        | filename (UTF-8)                  | ✅ done M2 |
+| SEGMENT_CONTENTS     | 0x31 | any → any        | file chunk (≤1400 bytes)          | ✅ done M2 |
+| SEGMENT_NOT_FOUND    | 0x32 | any → any        | —                                 | ✅ done M2 |
+| ACK                  | 0x40 | any → any        | next range (u16 start, u16 count) or empty + `COMPLETE` flag | ✅ done M2 |
 | PEERLIST_REQUEST     | 0x50 | peer → master    | —                              | ⏳ planned  |
 | PEERLIST_RESPONSE    | 0x51 | master → peer    | packed (ip:port) entries       | ⏳ planned  |
 
@@ -178,6 +178,10 @@ peer:    Idle ──► Handshaking ──► Synced ──► ManifestSync ─�
 ```
 
 ## 7. Reliability & flow control (M2)
+
+Implemented as described below (state machines live in `src/transfer.rs`;
+both nodes multiplex transfers on one socket via the event loop in
+`src/node.rs`).
 
 Reliability is **receiver-driven**. The receiver owns the window: it
 explicitly names the next packet range it wants. This eliminates the
@@ -289,7 +293,7 @@ qstream --help
 |----|--------------------------------------------------|--------|
 | M0 | Scaffold + UDP handshake (this spec, §5.3)       | ✅     |
 | M1 | Manifest exchange (poll + serve)                 | ✅     |
-| M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | 📝 spec'd §5.5/§7 |
+| M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | ✅     |
 | M3 | Peer discovery (PEERLIST) + job queue            | ⏳     |
 | M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ⏳     |
 | M5 | Robustness: retransmission, timeouts, fault tests| ⏳     |

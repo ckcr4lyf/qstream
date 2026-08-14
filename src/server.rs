@@ -1,72 +1,59 @@
-//! Master (seed) mode: bind a listening UDP socket, answer handshakes and
-//! manifest requests, maintain the peer list. See SPEC.md §6.
+//! Master (seed) mode (SPEC.md §6): serve manifest + segments over one UDP
+//! socket until interrupted.
 
-use std::collections::HashMap;
-use std::fs;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
-use std::path::Path;
+use std::net::UdpSocket;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::log;
-use crate::protocol::{self, Message};
+use crate::node::Node;
 
-/// Run the master node until the process is interrupted.
 pub fn run(port: u16, manifest_path: &str, name: &str) -> io::Result<()> {
-    if !Path::new(manifest_path).is_file() {
-        log::error(&format!("manifest file not found: {manifest_path}"));
+    let manifest_path = PathBuf::from(manifest_path);
+    if !manifest_path.is_file() {
+        log::error(&format!(
+            "manifest file not found: {}",
+            manifest_path.display()
+        ));
         std::process::exit(1);
     }
+    let segment_root = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     let socket = UdpSocket::bind(("0.0.0.0", port))?;
     log::info(&format!("master listening on 0.0.0.0:{port} (name: {name})"));
-    log::info(&format!("serving manifest from {manifest_path}"));
+    log::info(&format!("serving manifest from {}", manifest_path.display()));
+    log::info(&format!("serving segments from {}", segment_root.display()));
 
-    // Peer list keyed by socket address; value is the peer's self-reported name.
-    let mut peers: HashMap<SocketAddr, String> = HashMap::new();
-
+    let mut node = Node::new(socket, name.to_string(), manifest_path, segment_root);
     let mut buf = [0u8; 65536];
+
     loop {
-        let (n, src) = socket.recv_from(&mut buf)?;
+        // Clamp zero (deadline already passed) to 1ns: set_read_timeout
+        // rejects a 0-duration timeout on Linux; we want to tick immediately.
+        let timeout = node.next_deadline().map(|d| {
+            let rem = d.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                Duration::from_nanos(1)
+            } else {
+                rem
+            }
+        });
+        node.socket.set_read_timeout(timeout)?;
 
-        match protocol::decode(&buf[..n]) {
-            Ok(Message::HandshakeRequest { name: peer_name }) => {
-                match peers.get(&src) {
-                    None => log::info(&format!("peer connected: {src} (name: {peer_name})")),
-                    Some(existing) if *existing != peer_name => {
-                        log::info(&format!("peer {src} re-handshaked, new name: {peer_name}"));
-                    }
-                    _ => {}
-                }
-                peers.insert(src, peer_name);
-
-                let reply = Message::HandshakeResponse {
-                    name: name.to_string(),
-                };
-                socket.send_to(&protocol::encode(&reply), src)?;
-                log::trace(&format!("replied HANDSHAKE_RESPONSE to {src}"));
+        match node.socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                node.handle(&buf[..n], src);
             }
-            Ok(Message::ManifestRequest) => {
-                // Re-read from disk every time — the live playlist rolls.
-                match fs::read(manifest_path) {
-                    Ok(data) => {
-                        let len = data.len();
-                        let reply = Message::ManifestResponse { data };
-                        socket.send_to(&protocol::encode(&reply), src)?;
-                        log::trace(&format!(
-                            "replied MANIFEST_RESPONSE ({len} bytes) to {src}"
-                        ));
-                    }
-                    Err(e) => {
-                        log::error(&format!("failed to read manifest {manifest_path}: {e}"));
-                        // Empty response tells the peer we have nothing right now.
-                        let reply = Message::ManifestResponse { data: Vec::new() };
-                        socket.send_to(&protocol::encode(&reply), src)?;
-                    }
-                }
-            }
-            other => {
-                log::warn(&format!("ignoring unexpected message from {src}: {other:?}"));
-            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
         }
+
+        node.tick(Instant::now());
     }
 }
