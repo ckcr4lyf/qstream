@@ -78,46 +78,95 @@ pub fn valid_filename(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Sender (serving a file)
 
+/// Packets sent per tick — pacing is deadline-driven, never blocking.
+const SEND_CHUNK: u16 = 8;
+
 pub struct SenderTransfer {
     pub transfer_id: u16,
     pub remote: SocketAddr,
     pub total_packets: u16,
     file: Vec<u8>,
-    range: (u16, u16), // (start, count) currently being sent
+    range: (u16, u16),      // (start, count) of the current window
+    range_sent: u16,        // packets of the current window already sent
     retry_count: u32,
-    deadline: Instant, // ack timer
+    ack_deadline: Option<Instant>, // armed once the window is fully sent
+    send_deadline: Instant,        // when to send the next chunk
 }
 
 impl SenderTransfer {
     pub fn new(transfer_id: u16, remote: SocketAddr, file: Vec<u8>) -> Self {
         let n = packet_count(file.len());
+        let count = INITIAL_WINDOW.min(n);
         SenderTransfer {
             transfer_id,
             remote,
             total_packets: n,
             file,
-            range: (1, INITIAL_WINDOW.min(n)),
+            range: (1, count),
+            range_sent: 0,
             retry_count: 0,
-            deadline: Instant::now() + ack_timeout(INITIAL_WINDOW.min(n)),
+            ack_deadline: None,
+            send_deadline: Instant::now(),
         }
     }
 
     pub fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
-    pub fn send_range(&mut self, socket: &UdpSocket) {
-        let (start, count) = self.range;
-        if count > 0 {
-            self.send_packets(socket, start, count);
+        if self.range_sent >= self.range.1 {
+            // Window fully sent — next event is the ack timer.
+            self.ack_deadline.unwrap_or(self.send_deadline)
+        } else {
+            self.send_deadline
         }
-        self.deadline = Instant::now() + ack_timeout(count.max(1));
     }
 
-    fn send_packets(&self, socket: &UdpSocket, start: u16, count: u16) {
-        let pace = Duration::from_millis(settings().pace_ms);
+    /// Advance the state machine; called once per loop tick.
+    pub fn tick(&mut self, socket: &UdpSocket, now: Instant) -> Result<(), String> {
+        let (start, count) = self.range;
+
+        // Send the next chunk of the current window (paced, non-blocking).
+        if self.range_sent < count && now >= self.send_deadline {
+            let to_send = (count - self.range_sent).min(SEND_CHUNK);
+            let first = (start as u32 + self.range_sent as u32) as u16;
+            self.send_packets(socket, first, to_send);
+            self.range_sent += to_send;
+            let pace = Duration::from_millis(settings().pace_ms);
+            if pace > Duration::ZERO && to_send > 0 {
+                self.send_deadline = now + pace.saturating_mul(to_send as u32);
+            } else {
+                self.send_deadline = now;
+            }
+            if self.range_sent >= count {
+                self.ack_deadline = Some(now + ack_timeout(count));
+            }
+        }
+
+        // Ack timer: the window was fully sent but no ACK arrived.
+        if self.range_sent >= count {
+            if let Some(ack) = self.ack_deadline {
+                if now >= ack {
+                    self.retry_count += 1;
+                    if self.retry_count > RETRY_LIMIT {
+                        return Err(format!(
+                            "sender {:#06x}: no ACK for range {:?} after {RETRY_LIMIT} retries",
+                            self.transfer_id, self.range
+                        ));
+                    }
+                    log::debug(&format!(
+                        "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{RETRY_LIMIT})",
+                        self.transfer_id, self.range, self.retry_count
+                    ));
+                    self.range_sent = 0;
+                    self.ack_deadline = None;
+                    self.send_deadline = now;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn send_packets(&self, socket: &UdpSocket, first_packet: u16, count: u16) {
         for i in 0..count {
-            let packet_number = (start as u32 + i as u32) as u16;
+            let packet_number = (first_packet as u32 + i as u32) as u16;
             let seek = (packet_number as usize - 1) * SEGMENT_PACKET_SIZE;
             let end = (seek + SEGMENT_PACKET_SIZE).min(self.file.len());
             let msg = Message::SegmentContents {
@@ -131,9 +180,6 @@ impl SenderTransfer {
                     "sender {:#06x}: send failed: {e}",
                     self.transfer_id
                 ));
-            }
-            if pace > Duration::ZERO && i + 1 < count {
-                std::thread::sleep(pace);
             }
         }
     }
@@ -155,33 +201,21 @@ impl SenderTransfer {
                 if start >= 1 && start <= n {
                     let count = count.min(n - start + 1);
                     self.range = (start as u16, count as u16);
+                    self.range_sent = 0;
+                    self.ack_deadline = None;
                     self.retry_count = 0;
-                    self.send_range(socket);
+                    self.send_deadline = Instant::now();
                 } else {
                     // Bogus or already-covered range: nothing to send; wait
                     // for the receiver's COMPLETE.
-                    self.deadline = Instant::now() + ack_timeout(1);
+                    self.range = (1, 0);
+                    self.range_sent = 0;
+                    self.ack_deadline = Some(Instant::now() + ack_timeout(1));
                 }
+                let _ = socket; // socket retained for signature symmetry
                 false
             }
         }
-    }
-
-    /// Ack timer fired: retransmit the current range, or fail.
-    pub fn on_timeout(&mut self, socket: &UdpSocket) -> Result<(), String> {
-        self.retry_count += 1;
-        if self.retry_count > RETRY_LIMIT {
-            return Err(format!(
-                "sender {:#06x}: no ACK for range {:?} after {RETRY_LIMIT} retries",
-                self.transfer_id, self.range
-            ));
-        }
-        log::debug(&format!(
-            "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{RETRY_LIMIT})",
-            self.transfer_id, self.range, self.retry_count
-        ));
-        self.send_range(socket);
-        Ok(())
     }
 }
 
@@ -535,8 +569,7 @@ impl TransferRegistry {
         let filepath = self.segment_root.join(filename);
         match fs::read(&filepath) {
             Ok(file) => {
-                let mut sender = SenderTransfer::new(transfer_id, src, file);
-                sender.send_range(socket);
+                let sender = SenderTransfer::new(transfer_id, src, file);
                 log::info(&format!(
                     "serving {filename} to {src} (transfer {transfer_id:#06x}, {} packets)",
                     sender.total_packets
@@ -642,16 +675,14 @@ impl TransferRegistry {
 
     /// Advance all transfers whose timers have expired.
     pub fn tick(&mut self, socket: &UdpSocket, now: Instant) {
-        // Senders: ack timeouts.
+        // Senders: chunk sends + ack timeouts (paced, non-blocking).
         let mut expired: Vec<u16> = Vec::new();
         for (id, sender) in self.senders.iter_mut() {
-            if now >= sender.deadline() {
-                match sender.on_timeout(socket) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        log::warn(&e);
-                        expired.push(*id);
-                    }
+            match sender.tick(socket, now) {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn(&e);
+                    expired.push(*id);
                 }
             }
         }

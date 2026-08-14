@@ -4,3 +4,5 @@
 
 # generated artifacts
 /page-*.png
+/swarm-data/
+/swarm.pids

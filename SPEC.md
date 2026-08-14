@@ -278,7 +278,7 @@ ack timeout:
 | `SEGMENT_PACKET_SIZE`       | 1400  | bytes per content packet               |
 | `INITIAL_WINDOW`            | 5     | first range size                       |
 | `MAX_WINDOW`                | 64    | largest range size                     |
-| `PACE_INTERVAL_MS`          | 1     | sleep between packets (rate limiter)   |
+| `PACE_INTERVAL_MS`          | 1     | min spacing between packets (deadline-paced, non-blocking) |
 | `WINDOW_QUIET_MS`           | 150   | receiver quiet period before ACKing    |
 | `FIRST_RESPONSE_TIMEOUT_MS` | 2000  | give up if nothing arrives             |
 | `WINDOW_RETRY_LIMIT`        | 8     | receiver re-request limit              |
