@@ -305,21 +305,66 @@ The transfer registry is bounded (`MAX_CONCURRENT_TRANSFERS`); failed,
 complete and timed-out transfers are evicted. Filenames are validated to
 reject path traversal (no `/`, `\`, leading `.`, control characters).
 
-### 7.6 Job queue & peer selection (M3)
+### 7.6 Job queue & peer selection (M3, ranking M5)
 
 Missing segments from the manifest become jobs in a queue. The peer runs up
 to `MAX_PARALLEL_DOWNLOADS` downloads concurrently, one receiver per job:
 
-- **Peer selection:** peers with the fewest in-flight transfers to us,
-  never a peer that already failed this job; pseudo-random tiebreak for
-  load spreading; bootstrap is just another (well-populated) peer.
+- **Peer selection (M5):** each peer carries a quality score (start 50;
+  +2 per successful pull, −1 per `SEGMENT_NOT_FOUND`, −10 per no-response,
+  −3 other failures; clamped 0..100). Candidates are weighted by
+  `score/(inflight+1)` and picked by weighted random draw, with the
+  bootstrap scored at 0.85× so peers take over the load as they prove
+  themselves. New (unproven) peers start at 50 — benefit of the doubt.
 - **Retry:** a failed job (timeout / `SEGMENT_NOT_FOUND`) is retried with
   another untried peer; when all peers are exhausted the job rests in a
   `FAIL_RETRY_COOLDOWN_MS = 5000` cooldown before the next manifest sync
   re-queues it.
-- **Dead-peer eviction:** a receiver that never gets a first response
-  removes that peer from the registry immediately (rather than waiting out
-  the TTL), so dead peers stop occupying download slots.
+- **Dead-peer eviction (M5):** a receiver that never gets a first response
+  counts an "unresponsive hit"; only after `EVICT_AFTER_UNRESPONSIVE = 3`
+  consecutive hits is the peer evicted. One bad moment (dropped request,
+  burst) is forgiven; a pattern is not.
+- **Ranking visibility (M5):** every node logs `peer ranking:` once a
+  minute and serves `GET /peers` (scores, pulls/serves, failures, latency)
+  over its HTTP port.
+
+### 7.7 Adaptive timers (M5)
+
+Real links don't have fixed RTTs, so the fixed quiet/ack constants were
+replaced with estimates that adapt to what a transfer actually observes:
+
+- **Receiver quiet period** = max(150 ms, 3 × EWMA(inter-packet gap) + 50 ms)
+  × 2^backoff (cap 8 s). A delayed link spaces packets out; without this the
+  receiver would treat the gaps as loss and burn its retry budget. Backoff
+  grows on each re-request and resets on any new packet, so a drop burst
+  spreads its retries across the outage instead of exhausting them mid-way.
+- **Sender ack timeout** = max(base(count), 2 × EWMA(measured RTT) + 150 ms),
+  with exponential backoff (×1.6 per retry, cap 8 s) and a `SENDER_RETRY_LIMIT
+  = 30` budget that deliberately outlives the receiver's, so a stalled window
+  can recover from the sender side too.
+- **Request resend:** if no first packet arrives by half the
+  first-response timeout (4 s), the receiver resends the `SEGMENT_REQUEST`
+  with a fresh budget — a single dropped request costs ~2 s instead of 4 s.
+- **Retention:** `QSTREAM_RETENTION_SECS` (default 0 = off) keeps old
+  segments servable past the playlist edge — a viewer 3-4 s behind the live
+  edge (or recovering from a stall) still finds its segments. Old pieces are
+  pruned once they leave the playlist and exceed the window.
+
+### 7.8 Fault injection (M5)
+
+Every node can be given a sick link for testing, via env vars applied in the
+single outgoing-datagram choke point (`FaultInjector`, seeded SplitMix64):
+
+| Var | Effect |
+|---|---|
+| `QSTREAM_FAULT_DROP_PCT` | % of outgoing datagrams dropped |
+| `QSTREAM_FAULT_DUP_PCT` | % sent twice |
+| `QSTREAM_FAULT_DELAY_MS` | fixed one-way latency on outgoing |
+| `QSTREAM_FAULT_REORDER_PCT` | % of sends swapped with the next |
+| `QSTREAM_FAULT_BURST_EVERY_MS/DUR_MS` | periodic full-drop bursts |
+| `QSTREAM_FAULT_SEED` | RNG seed (0 = time) |
+
+Faults hit all datagram types (control + data), like a real bad link.
 
 ## 8. CLI
 
@@ -349,7 +394,8 @@ qstream --help
 | M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | ✅     |
 | M3 | Peer discovery (PEERLIST) + job queue            | ✅     |
 | M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ✅     |
-| M5 | Robustness: retransmission, timeouts, fault tests| ⏳     |
+| M5 | Robustness: fault injection, adaptive timers, peer ranking, retention (§7.7-7.8) | ✅     |
+| M6 | Ideas backlog: master failover, TCP-ish pacing, stats dashboard, score exchange | ⏳     |
 
 ## 10. Playback (M4)
 
