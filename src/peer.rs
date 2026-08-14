@@ -1,39 +1,140 @@
 //! Peer mode: bind a fixed local port (so other peers can reach us later),
-//! handshake with the master, and report the result. See SPEC.md §5.3.
+//! handshake with the master, then poll its manifest and keep a local copy.
+//! See SPEC.md §5.3–5.4.
 
+use std::fs;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::log;
 use crate::protocol::{self, Message};
 
-/// How long to wait for the master's HANDSHAKE_RESPONSE (SPEC.md §5.3).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MANIFEST_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Run the peer: send one handshake request, wait for the reply.
-pub fn run(local_port: u16, remote: SocketAddr, name: &str) -> io::Result<()> {
+/// Run the peer: handshake once, then poll the manifest forever.
+pub fn run(local_port: u16, remote: SocketAddr, name: &str, data_dir: &str) -> io::Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
-    log::info(&format!("peer listening on 0.0.0.0:{local_port} (name: {name})"));
+    log::info(&format!(
+        "peer listening on 0.0.0.0:{local_port} (name: {name}, data dir: {data_dir})"
+    ));
+    fs::create_dir_all(data_dir)?;
 
-    let request = Message::HandshakeRequest {
-        name: name.to_string(),
+    // 1. Handshake (SPEC §5.3)
+    let server_name = match transact(
+        &socket,
+        remote,
+        &Message::HandshakeRequest {
+            name: name.to_string(),
+        },
+        |m| match m {
+            Message::HandshakeResponse { name } => Some(name.clone().into_bytes()),
+            _ => None,
+        },
+        HANDSHAKE_TIMEOUT,
+    )? {
+        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        None => {
+            log::error(&format!("handshake timed out — no reply from {remote}"));
+            std::process::exit(1);
+        }
     };
-    socket.send_to(&protocol::encode(&request), remote)?;
-    log::info(&format!("sent HANDSHAKE_REQUEST to {remote}"));
+    log::info(&format!("handshake OK — master {remote} (name: {server_name})"));
 
-    socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut buf = [0u8; 65536];
-
+    // 2. Manifest sync loop (SPEC §5.4)
+    log::info(&format!(
+        "polling manifest every {}s",
+        MANIFEST_POLL_INTERVAL.as_secs()
+    ));
+    let mut last_manifest: Option<Vec<u8>> = None;
     loop {
+        match transact(
+            &socket,
+            remote,
+            &Message::ManifestRequest,
+            |m| match m {
+                Message::ManifestResponse { data } => Some(data.clone()),
+                _ => None,
+            },
+            MANIFEST_TIMEOUT,
+        ) {
+            Ok(Some(data)) if !data.is_empty() => {
+                if last_manifest.as_deref() != Some(data.as_slice()) {
+                    let segment_count = data
+                        .split(|b| *b == b'\n')
+                        .filter(|line| !line.is_empty() && line[0] != b'#')
+                        .count();
+                    write_manifest(data_dir, &data)?;
+                    log::info(&format!(
+                        "manifest updated ({segment_count} segments, {} bytes)",
+                        data.len()
+                    ));
+                    log::debug(&format!(
+                        "manifest contents:\n{}",
+                        String::from_utf8_lossy(&data)
+                    ));
+                    last_manifest = Some(data);
+                } else {
+                    log::debug("manifest unchanged");
+                }
+            }
+            Ok(Some(_)) => {
+                log::warn("master returned an empty manifest — keeping previous copy");
+            }
+            Ok(None) => {
+                log::warn(&format!(
+                    "manifest request timed out — will retry in {}s",
+                    MANIFEST_POLL_INTERVAL.as_secs()
+                ));
+            }
+            Err(e) => {
+                log::error(&format!("manifest request failed: {e}"));
+            }
+        }
+        std::thread::sleep(MANIFEST_POLL_INTERVAL);
+    }
+}
+
+/// Atomically write the manifest into `data_dir/live.m3u8` (tmp + rename).
+fn write_manifest(data_dir: &str, data: &[u8]) -> io::Result<()> {
+    let real = Path::new(data_dir).join("live.m3u8");
+    let tmp = Path::new(data_dir).join("live.m3u8.tmp");
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, &real)?;
+    Ok(())
+}
+
+/// Send `request`, then wait up to `timeout` for a datagram that `extract`
+/// recognizes. Returns the extracted payload, or `None` on timeout.
+/// Datagrams that don't match are logged and skipped.
+fn transact(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    request: &Message,
+    extract: impl Fn(&Message) -> Option<Vec<u8>>,
+    timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    socket.send_to(&protocol::encode(request), remote)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 65536];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        socket.set_read_timeout(Some(remaining))?;
+
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => match protocol::decode(&buf[..n]) {
-                Ok(Message::HandshakeResponse { name: server_name }) => {
-                    log::info(&format!("handshake OK — master {src} (name: {server_name})"));
-                    return Ok(());
-                }
-                Ok(other) => {
-                    log::warn(&format!("unexpected message from {src}: {other:?}"));
+                Ok(msg) => {
+                    if let Some(payload) = extract(&msg) {
+                        return Ok(Some(payload));
+                    }
+                    log::debug(&format!("ignoring unexpected message from {src}: {msg:?}"));
                 }
                 Err(e) => {
                     log::warn(&format!("dropping malformed datagram from {src}: {e}"));
@@ -43,11 +144,7 @@ pub fn run(local_port: u16, remote: SocketAddr, name: &str) -> io::Result<()> {
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut =>
             {
-                log::error(&format!(
-                    "handshake timed out after {}s — no reply from {remote}",
-                    HANDSHAKE_TIMEOUT.as_secs()
-                ));
-                std::process::exit(1);
+                return Ok(None);
             }
             Err(e) => return Err(e),
         }

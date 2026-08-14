@@ -3,7 +3,7 @@
 > Modern Rust rewrite of the `udp-file-transfer` P2P video streaming design.
 > Single static binary, no runtime dependencies. `std`-only for now.
 >
-> Status: **v0 — Milestone M0 (project scaffold + handshake) implemented.**
+> Status: **v0.1 — Milestones M0 (handshake) and M1 (manifest exchange) implemented.**
 
 ---
 
@@ -99,8 +99,8 @@ Messages whose magic/version don't match are dropped and logged.
 | HANDSHAKE_RESPONSE   | 0x02 | master → peer    | node name (UTF-8)              | ✅ done M0 |
 | PING                 | 0x10 | any → any        | —                              | ⏳ planned  |
 | PONG                 | 0x11 | any → any        | —                              | ⏳ planned  |
-| MANIFEST_REQUEST     | 0x20 | peer → master    | —                              | ⏳ planned  |
-| MANIFEST_RESPONSE    | 0x21 | master → peer    | m3u8 contents                  | ⏳ planned  |
+| MANIFEST_REQUEST     | 0x20 | peer → master    | —                              | ✅ done M1 |
+| MANIFEST_RESPONSE    | 0x21 | master → peer    | m3u8 contents (raw bytes)      | ✅ done M1 |
 | SEGMENT_REQUEST      | 0x30 | any → any        | filename (UTF-8)               | ⏳ planned  |
 | SEGMENT_CONTENTS     | 0x31 | any → any        | file data (packetized)         | ⏳ planned  |
 | SEGMENT_NOT_FOUND    | 0x32 | any → any        | —                              | ⏳ planned  |
@@ -121,13 +121,27 @@ A node that receives `HANDSHAKE_RESPONSE` for a request it never made is
 ignored/logged. Duplicate handshakes are idempotent (peer list is keyed by
 `SocketAddr`; name updates are allowed).
 
+### 5.4 Manifest exchange (M1)
+
+1. After a successful handshake, the peer sends `MANIFEST_REQUEST` to the
+   master every `MANIFEST_POLL_INTERVAL_MS = 3000`.
+2. The master re-reads its manifest file from disk on every request (the live
+   playlist rolls) and replies `MANIFEST_RESPONSE` with the raw m3u8 bytes.
+3. The peer writes the response atomically (tmp + rename) to
+   `<data-dir>/live.m3u8`, keeping its local copy in sync.
+4. Empty response (master read failure) → peer keeps its previous copy and
+   logs a warning. Request timeout → warn and retry on the next poll.
+
+There is no per-request retry inside a poll; the next poll (3s later) is the
+retry. A peer tracks the last manifest it wrote and only rewrites on change.
+
 ## 6. Node states
 
 ```
-master:  Listening ──► Serving (handles requests until Ctrl-C)
+master:  Listening ──► Serving (handshake + manifest requests until Ctrl-C)
 
-peer:    Idle ──► Handshaking ──► Synced ──► Streaming (poll manifest,
-         queue segments, serve peers)        ──► (planned M1+)
+peer:    Idle ──► Handshaking ──► Synced ──► ManifestSync (poll manifest
+         every 3s, write local copy)        ──► SegmentSync (planned M2+)
 ```
 
 ## 7. Reliability & flow control (planned, inherited from v1 design)
@@ -146,21 +160,24 @@ peer:    Idle ──► Handshaking ──► Synced ──► Streaming (poll m
 ## 8. CLI
 
 ```
-qstream server <port>                          # master/seed mode
-qstream peer <local-port> <remote-ip> <remote-port>   # peer mode
+qstream server <port> <manifest-path>                        # master/seed mode
+qstream peer <local-port> <remote-ip> <remote-port> [data-dir]       # peer mode
 qstream --help
 ```
 
-- `server <port>` binds `0.0.0.0:<port>`.
+- `server <port> <manifest-path>` binds `0.0.0.0:<port>` and serves the
+  m3u8 playlist at `<manifest-path>` (validated at startup).
 - `peer <local-port> ...` binds `0.0.0.0:<local-port>` so peers can later be
-  reached by other peers on a known port.
+  reached by other peers on a known port. `[data-dir]` defaults to `./data`;
+  the synced manifest is written to `<data-dir>/live.m3u8`.
+- `QSTREAM_LOG=error|warn|info|debug|trace` controls verbosity (default info).
 
 ## 9. Milestones
 
 | #  | Milestone                                        | Status |
 |----|--------------------------------------------------|--------|
 | M0 | Scaffold + UDP handshake (this spec, §5.3)       | ✅     |
-| M1 | Manifest exchange (poll + serve)                 | ⏳     |
+| M1 | Manifest exchange (poll + serve)                 | ✅     |
 | M2 | Segment transfer: windows, ACKs, reassembly      | ⏳     |
 | M3 | Peer discovery (PEERLIST) + job queue            | ⏳     |
 | M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ⏳     |
@@ -170,8 +187,9 @@ qstream --help
 
 - **Unit:** codec round-trips (encode/decode every message), malformed
   header rejection (bad magic/version/truncation), length edge cases.
-- **Integration:** master + peer on loopback; assert handshake outcome and
-  peer list contents.
+- **Integration:** master + peer on loopback; assert handshake outcome,
+  peer list contents, and that the peer's synced manifest tracks the
+  master's rolling playlist (sequence numbers advance in lockstep).
 - **Fault injection (M2+):** test harness that drops/duplicates/reorders
   packets via an env var, to validate window/retry logic.
 - **E2E (M4+):** ffmpeg-generated HLS → master → 2 peers → `ffplay` playback

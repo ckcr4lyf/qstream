@@ -14,9 +14,10 @@ pub const HEADER_SIZE: usize = 8;
 pub enum MessageType {
     HandshakeRequest = 0x01,
     HandshakeResponse = 0x02,
+    ManifestRequest = 0x20,
+    ManifestResponse = 0x21,
     // Planned (SPEC §5.2) — reserved codes:
     // Ping = 0x10, Pong = 0x11,
-    // ManifestRequest = 0x20, ManifestResponse = 0x21,
     // SegmentRequest = 0x30, SegmentContents = 0x31, SegmentNotFound = 0x32,
     // Ack = 0x40,
     // PeerlistRequest = 0x50, PeerlistResponse = 0x51,
@@ -27,6 +28,8 @@ impl MessageType {
         match code {
             0x01 => Some(MessageType::HandshakeRequest),
             0x02 => Some(MessageType::HandshakeResponse),
+            0x20 => Some(MessageType::ManifestRequest),
+            0x21 => Some(MessageType::ManifestResponse),
             _ => None,
         }
     }
@@ -39,6 +42,10 @@ pub enum Message {
     HandshakeRequest { name: String },
     /// HANDSHAKE_RESPONSE — payload: node name (UTF-8).
     HandshakeResponse { name: String },
+    /// MANIFEST_REQUEST — no payload.
+    ManifestRequest,
+    /// MANIFEST_RESPONSE — payload: raw manifest (m3u8) bytes.
+    ManifestResponse { data: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,21 +100,17 @@ fn encode_header(message_type: MessageType, data_length: u16) -> [u8; HEADER_SIZ
 
 /// Encode a message into a datagram buffer.
 pub fn encode(message: &Message) -> Vec<u8> {
-    match message {
-        Message::HandshakeRequest { name } | Message::HandshakeResponse { name } => {
-            let payload = name.as_bytes();
-            let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
-            buf.extend_from_slice(&encode_header(
-                match message {
-                    Message::HandshakeRequest { .. } => MessageType::HandshakeRequest,
-                    Message::HandshakeResponse { .. } => MessageType::HandshakeResponse,
-                },
-                payload.len() as u16,
-            ));
-            buf.extend_from_slice(payload);
-            buf
-        }
-    }
+    let (message_type, payload): (MessageType, &[u8]) = match message {
+        Message::HandshakeRequest { name } => (MessageType::HandshakeRequest, name.as_bytes()),
+        Message::HandshakeResponse { name } => (MessageType::HandshakeResponse, name.as_bytes()),
+        Message::ManifestRequest => (MessageType::ManifestRequest, &[]),
+        Message::ManifestResponse { data } => (MessageType::ManifestResponse, data.as_slice()),
+    };
+
+    let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
+    buf.extend_from_slice(&encode_header(message_type, payload.len() as u16));
+    buf.extend_from_slice(payload);
+    buf
 }
 
 /// Decode a datagram into a message, validating magic, version and lengths.
@@ -140,12 +143,22 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
     }
     let payload = &payload[..data_length];
 
-    let name = String::from_utf8(payload.to_vec()).map_err(|_| ProtocolError::InvalidUtf8)?;
-
     Ok(match message_type {
-        MessageType::HandshakeRequest => Message::HandshakeRequest { name },
-        MessageType::HandshakeResponse => Message::HandshakeResponse { name },
+        MessageType::HandshakeRequest => Message::HandshakeRequest {
+            name: utf8_name(payload)?,
+        },
+        MessageType::HandshakeResponse => Message::HandshakeResponse {
+            name: utf8_name(payload)?,
+        },
+        MessageType::ManifestRequest => Message::ManifestRequest,
+        MessageType::ManifestResponse => Message::ManifestResponse {
+            data: payload.to_vec(),
+        },
     })
+}
+
+fn utf8_name(payload: &[u8]) -> Result<String, ProtocolError> {
+    String::from_utf8(payload.to_vec()).map_err(|_| ProtocolError::InvalidUtf8)
 }
 
 #[cfg(test)]
@@ -174,6 +187,23 @@ mod tests {
         let datagram = encode(&msg);
         assert_eq!(datagram.len(), HEADER_SIZE); // zero-length payload
         assert_eq!(decode(&datagram).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_manifest_request() {
+        let msg = Message::ManifestRequest;
+        let datagram = encode(&msg);
+        assert_eq!(datagram.len(), HEADER_SIZE); // no payload
+        assert_eq!(decode(&datagram).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_manifest_response() {
+        let msg = Message::ManifestResponse {
+            data: b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg_0000.ts\n"
+                .to_vec(),
+        };
+        assert_eq!(decode(&encode(&msg)).unwrap(), msg);
     }
 
     #[test]
