@@ -1,5 +1,6 @@
 //! qstream — P2P live video streaming over UDP. See SPEC.md.
 
+mod fault;
 mod http;
 mod log;
 mod node;
@@ -26,8 +27,19 @@ EXAMPLES:
 Play the stream: ffplay http://127.0.0.1:8080/live.m3u8 -live_start_index 0
 
 Env:
-    QSTREAM_NAME  node name sent in handshake (default \"master\" / \"peer\")
-    QSTREAM_LOG   log level: error | warn | info | debug | trace (default info)
+    QSTREAM_NAME            node name sent in handshake (default \"master\" / \"peer\")
+    QSTREAM_LOG             log level: error | warn | info | debug | trace (default info)
+    QSTREAM_PACING_MS       pacing between packets, ms (default 1)
+    QSTREAM_QUIET_MS        receiver quiet period, ms (default 150; adaptive M5)
+    QSTREAM_FIRST_TIMEOUT_MS  first-response timeout, ms (default 4000)
+    QSTREAM_RETENTION_SECS  keep old segments this long for playback (default 0 = off)
+Fault injection (M5, per-node):
+    QSTREAM_FAULT_DROP_PCT     %% of outgoing datagrams dropped
+    QSTREAM_FAULT_DUP_PCT      %% sent twice
+    QSTREAM_FAULT_DELAY_MS     fixed one-way latency on outgoing datagrams
+    QSTREAM_FAULT_REORDER_PCT  %% of sends swapped with the next one
+    QSTREAM_FAULT_BURST_EVERY_MS / QSTREAM_FAULT_BURST_DUR_MS  drop bursts
+    QSTREAM_FAULT_SEED         RNG seed (0 = time-based)
 ";
 
 fn main() -> ExitCode {

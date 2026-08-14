@@ -5,9 +5,11 @@
 use std::io;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::fault::FaultInjector;
 use crate::http;
 use crate::log;
 use crate::node::Node;
@@ -38,17 +40,39 @@ pub fn run(
 
     if let Some(hp) = http_port {
         let root = segment_root.clone();
+        let stats: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stats_http = stats.clone();
         thread::spawn(move || {
-            if let Err(e) = http::serve(root, hp) {
+            if let Err(e) = http::serve(root, hp, Some(stats_http)) {
                 log::error(&format!("http server failed: {e}"));
                 std::process::exit(1);
             }
         });
+        let mut node = Node::new(
+            socket,
+            name.to_string(),
+            manifest_path,
+            segment_root,
+            FaultInjector::from_env(),
+            Some(stats),
+        );
+        let mut buf = [0u8; 65536];
+        run_loop(&mut node, &mut buf)
+    } else {
+        let mut node = Node::new(
+            socket,
+            name.to_string(),
+            manifest_path,
+            segment_root,
+            FaultInjector::from_env(),
+            None,
+        );
+        let mut buf = [0u8; 65536];
+        run_loop(&mut node, &mut buf)
     }
+}
 
-    let mut node = Node::new(socket, name.to_string(), manifest_path, segment_root);
-    let mut buf = [0u8; 65536];
-
+fn run_loop(node: &mut Node, buf: &mut [u8; 65536]) -> io::Result<()> {
     loop {
         // Clamp zero (deadline already passed) to 1ns: set_read_timeout
         // rejects a 0-duration timeout on Linux; we want to tick immediately.
@@ -62,7 +86,7 @@ pub fn run(
         });
         node.socket.set_read_timeout(timeout)?;
 
-        match node.socket.recv_from(&mut buf) {
+        match node.socket.recv_from(buf) {
             Ok((n, src)) => {
                 node.handle(&buf[..n], src);
             }

@@ -14,22 +14,27 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::fault::FaultInjector;
 use crate::log;
 use crate::protocol::{self, AckType, Message};
 
 pub const SEGMENT_PACKET_SIZE: usize = 1400;
 pub const INITIAL_WINDOW: u16 = 5;
 pub const MAX_WINDOW: u16 = 64;
-pub const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Receiver re-request retries (with backoff, ~25 s worst case).
 pub const RETRY_LIMIT: u32 = 8;
+/// Sender ack-timeout retries (with backoff, outlives the receiver's budget
+/// so a burst-stalled window can recover).
+pub const SENDER_RETRY_LIMIT: u32 = 30;
 pub const COMPLETE_GRACE: Duration = Duration::from_millis(2000);
-pub const MAX_CONCURRENT_TRANSFERS: usize = 16;
+pub const MAX_CONCURRENT_TRANSFERS: usize = 32;
 
 /// Tunables overridable via env (SPEC.md §7.4).
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub pace_ms: u64,
     pub quiet_ms: u64,
+    pub first_timeout_ms: u64,
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -45,6 +50,7 @@ pub fn settings() -> &'static Settings {
         Settings {
             pace_ms: env("QSTREAM_PACING_MS", 1),
             quiet_ms: env("QSTREAM_QUIET_MS", 150),
+            first_timeout_ms: env("QSTREAM_FIRST_TIMEOUT_MS", 4000),
         }
     })
 }
@@ -53,11 +59,42 @@ fn quiet_period() -> Duration {
     Duration::from_millis(settings().quiet_ms)
 }
 
-/// Sender-side ack timeout: enough time for the paced window to arrive plus
-/// the receiver's quiet period, with slack. Min 300 ms.
-fn ack_timeout(count: u16) -> Duration {
-    let ms = (count as u64 * settings().pace_ms + settings().quiet_ms + 100).max(300);
-    Duration::from_millis(ms)
+/// Receiver quiet period adapted to the observed inter-packet gap (M5): a
+/// delayed link spaces packets out, and a fixed quiet period would treat the
+/// gaps as loss and burn retries. `backoff` grows on repeated re-requests so
+/// a burst (all packets lost for a moment) spreads its retries instead of
+/// exhausting the budget in the middle of the outage.
+fn adaptive_quiet(gap_est: Duration, backoff: u32) -> Duration {
+    let base = quiet_period().max(gap_est.saturating_mul(3) + Duration::from_millis(50));
+    let mult = 1u32 << backoff.min(4);
+    base.saturating_mul(mult).min(Duration::from_secs(8))
+}
+
+/// Sender-side ack timeout: paced window delivery plus receiver quiet with
+/// slack, and at least 2× the measured RTT so delayed links don't cause
+/// blind retransmits. Min 300 ms.
+fn ack_timeout(count: u16, rtt_est: Duration) -> Duration {
+    let base = (count as u64 * settings().pace_ms + settings().quiet_ms + 100).max(300);
+    Duration::from_millis(base).max(rtt_est.saturating_mul(2) + Duration::from_millis(150))
+}
+
+/// Ack timeout for retry number `retries` — exponential backoff, capped.
+fn retry_interval(count: u16, rtt_est: Duration, retries: u32) -> Duration {
+    let base = ack_timeout(count, rtt_est);
+    let mult = 1u32 << retries.min(4);
+    base.saturating_mul(mult).min(Duration::from_secs(8))
+}
+
+/// Parse segment filenames out of an m3u8 playlist.
+pub fn parse_manifest(data: &[u8]) -> Vec<String> {
+    std::str::from_utf8(data)
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Number of packets for a file of `size` bytes (SPEC.md §5.5).
@@ -91,6 +128,8 @@ pub struct SenderTransfer {
     retry_count: u32,
     ack_deadline: Option<Instant>, // armed once the window is fully sent
     send_deadline: Instant,        // when to send the next chunk
+    rtt_est: Duration,             // EWMA of measured round-trip (M5)
+    window_sent_at: Option<Instant>,
 }
 
 impl SenderTransfer {
@@ -107,6 +146,8 @@ impl SenderTransfer {
             retry_count: 0,
             ack_deadline: None,
             send_deadline: Instant::now(),
+            rtt_est: Duration::from_millis(250),
+            window_sent_at: None,
         }
     }
 
@@ -120,14 +161,19 @@ impl SenderTransfer {
     }
 
     /// Advance the state machine; called once per loop tick.
-    pub fn tick(&mut self, socket: &UdpSocket, now: Instant) -> Result<(), String> {
+    pub fn tick(
+        &mut self,
+        socket: &UdpSocket,
+        fault: &mut FaultInjector,
+        now: Instant,
+    ) -> Result<(), String> {
         let (start, count) = self.range;
 
         // Send the next chunk of the current window (paced, non-blocking).
         if self.range_sent < count && now >= self.send_deadline {
             let to_send = (count - self.range_sent).min(SEND_CHUNK);
             let first = (start as u32 + self.range_sent as u32) as u16;
-            self.send_packets(socket, first, to_send);
+            self.send_packets(socket, fault, first, to_send);
             self.range_sent += to_send;
             let pace = Duration::from_millis(settings().pace_ms);
             if pace > Duration::ZERO && to_send > 0 {
@@ -136,7 +182,8 @@ impl SenderTransfer {
                 self.send_deadline = now;
             }
             if self.range_sent >= count {
-                self.ack_deadline = Some(now + ack_timeout(count));
+                self.window_sent_at = Some(now);
+                self.ack_deadline = Some(now + retry_interval(count, self.rtt_est, self.retry_count));
             }
         }
 
@@ -145,14 +192,14 @@ impl SenderTransfer {
             if let Some(ack) = self.ack_deadline {
                 if now >= ack {
                     self.retry_count += 1;
-                    if self.retry_count > RETRY_LIMIT {
+                    if self.retry_count > SENDER_RETRY_LIMIT {
                         return Err(format!(
-                            "sender {:#06x}: no ACK for range {:?} after {RETRY_LIMIT} retries",
+                            "sender {:#06x}: no ACK for range {:?} after {SENDER_RETRY_LIMIT} retries",
                             self.transfer_id, self.range
                         ));
                     }
                     log::debug(&format!(
-                        "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{RETRY_LIMIT})",
+                        "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{SENDER_RETRY_LIMIT})",
                         self.transfer_id, self.range, self.retry_count
                     ));
                     self.range_sent = 0;
@@ -164,7 +211,13 @@ impl SenderTransfer {
         Ok(())
     }
 
-    fn send_packets(&self, socket: &UdpSocket, first_packet: u16, count: u16) {
+    fn send_packets(
+        &self,
+        socket: &UdpSocket,
+        fault: &mut FaultInjector,
+        first_packet: u16,
+        count: u16,
+    ) {
         for i in 0..count {
             let packet_number = (first_packet as u32 + i as u32) as u16;
             let seek = (packet_number as usize - 1) * SEGMENT_PACKET_SIZE;
@@ -175,23 +228,12 @@ impl SenderTransfer {
                 total_packets: self.total_packets,
                 data: self.file[seek..end].to_vec(),
             };
-            if let Err(e) = socket.send_to(&protocol::encode(&msg), self.remote) {
-                log::error(&format!(
-                    "sender {:#06x}: send failed: {e}",
-                    self.transfer_id
-                ));
-            }
+            fault.send(socket, protocol::encode(&msg), self.remote, Instant::now());
         }
     }
 
     /// Handle an ACK. Returns `true` when the transfer is complete.
-    pub fn on_ack(
-        &mut self,
-        socket: &UdpSocket,
-        ack_type: AckType,
-        next_start: u16,
-        next_count: u16,
-    ) -> bool {
+    pub fn on_ack(&mut self, ack_type: AckType, next_start: u16, next_count: u16) -> bool {
         match ack_type {
             AckType::Complete => true,
             AckType::Progress => {
@@ -199,6 +241,11 @@ impl SenderTransfer {
                 let start = next_start as u32;
                 let count = next_count as u32;
                 if start >= 1 && start <= n {
+                    // New range: sample the round-trip from the previous
+                    // window's send to this advance (M5, adaptive timers).
+                    if let Some(t) = self.window_sent_at.take() {
+                        self.rtt_est = (self.rtt_est * 3 + t.elapsed()) / 4;
+                    }
                     let count = count.min(n - start + 1);
                     self.range = (start as u16, count as u16);
                     self.range_sent = 0;
@@ -210,9 +257,8 @@ impl SenderTransfer {
                     // for the receiver's COMPLETE.
                     self.range = (1, 0);
                     self.range_sent = 0;
-                    self.ack_deadline = Some(Instant::now() + ack_timeout(1));
+                    self.ack_deadline = Some(Instant::now() + retry_interval(1, self.rtt_est, 1));
                 }
-                let _ = socket; // socket retained for signature symmetry
                 false
             }
         }
@@ -236,7 +282,13 @@ pub struct ReceiverTransfer {
     deadline: Instant,
     outcome: Option<Result<(), String>>,
     unresponsive: bool,
+    not_found: bool,
     started_at: Instant,
+    gap_est: Duration,             // EWMA of inter-packet gaps (M5)
+    backoff: u32,                  // quiet-period backoff exponent
+    last_arrival: Option<Instant>,
+    first_packet_latency: Option<u64>,
+    request_resent: bool,
 }
 
 impl ReceiverTransfer {
@@ -256,12 +308,18 @@ impl ReceiverTransfer {
             total: None,
             range: None,
             retry_count: 0,
-            first_response_deadline: now + FIRST_RESPONSE_TIMEOUT,
+            first_response_deadline: now + Duration::from_millis(settings().first_timeout_ms),
             quiet_deadline: now + quiet_period(),
             deadline: now + quiet_period(),
             outcome: None,
             unresponsive: false,
+            not_found: false,
             started_at: now,
+            gap_est: quiet_period(),
+            backoff: 0,
+            last_arrival: None,
+            first_packet_latency: None,
+            request_resent: false,
         }
     }
 
@@ -292,30 +350,42 @@ impl ReceiverTransfer {
         self.unresponsive
     }
 
+    /// Fail because the peer replied it doesn't have the segment.
+    pub fn mark_not_found(&mut self) {
+        self.not_found = true;
+    }
+
+    pub fn not_found(&self) -> bool {
+        self.not_found
+    }
+
+    /// Milliseconds from request to first content packet.
+    pub fn first_packet_latency_ms(&self) -> Option<u64> {
+        self.first_packet_latency
+    }
+
     fn recompute_deadline(&mut self) {
         self.deadline = self.first_response_deadline.min(self.quiet_deadline);
     }
 
-    fn send_ack(&self, socket: &UdpSocket, (start, count): (u16, u16)) {
+    fn send_ack(&self, socket: &UdpSocket, fault: &mut FaultInjector, (start, count): (u16, u16)) {
         let msg = Message::Ack {
             transfer_id: self.transfer_id,
             ack_type: AckType::Progress,
             next_start: start,
             next_count: count,
         };
-        if let Err(e) = socket.send_to(&protocol::encode(&msg), self.remote) {
-            log::error(&format!("receiver {:#06x}: ack send failed: {e}", self.transfer_id));
-        }
+        fault.send(socket, protocol::encode(&msg), self.remote, Instant::now());
     }
 
-    fn send_complete(&self, socket: &UdpSocket) {
+    fn send_complete(&self, socket: &UdpSocket, fault: &mut FaultInjector) {
         let msg = Message::Ack {
             transfer_id: self.transfer_id,
             ack_type: AckType::Complete,
             next_start: 0,
             next_count: 0,
         };
-        let _ = socket.send_to(&protocol::encode(&msg), self.remote);
+        fault.send(socket, protocol::encode(&msg), self.remote, Instant::now());
     }
 
     fn range_complete(&self, start: u16, count: u16) -> bool {
@@ -326,6 +396,7 @@ impl ReceiverTransfer {
     pub fn on_content(
         &mut self,
         socket: &UdpSocket,
+        fault: &mut FaultInjector,
         packet_number: u16,
         total_packets: u16,
         data: Vec<u8>,
@@ -334,18 +405,19 @@ impl ReceiverTransfer {
             // Stray packet after completion: re-ACK COMPLETE so a lost final
             // ACK converges (SPEC.md §7.3).
             if self.outcome.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
-                self.send_complete(socket);
+                self.send_complete(socket, fault);
             }
             return;
         }
 
         if self.total.is_none() {
             self.total = Some(total_packets);
+            self.first_packet_latency = Some(self.started_at.elapsed().as_millis() as u64);
             let count = INITIAL_WINDOW.min(total_packets);
             self.range = Some((1, count));
             // Got data — first-response no longer applies.
             self.first_response_deadline = Instant::now() + Duration::from_secs(3600);
-            self.quiet_deadline = Instant::now() + quiet_period();
+            self.quiet_deadline = Instant::now() + adaptive_quiet(self.gap_est, 0);
         }
 
         let Some(total) = self.total else { return };
@@ -364,31 +436,37 @@ impl ReceiverTransfer {
                 "receiver {:#06x}: stray packet {packet_number} (current range ({start},{count})), nudging",
                 self.transfer_id
             ));
-            self.send_ack(socket, (start, count));
+            self.send_ack(socket, fault, (start, count));
             return;
         }
 
         if self.packets.contains_key(&packet_number) {
             return; // duplicate within range
         }
+        if let Some(prev) = self.last_arrival {
+            let gap = prev.elapsed();
+            self.gap_est = (self.gap_est * 3 + gap) / 4;
+        }
+        self.last_arrival = Some(Instant::now());
+        self.backoff = 0;
         self.packets.insert(packet_number, data);
-        self.quiet_deadline = Instant::now() + quiet_period();
+        self.quiet_deadline = Instant::now() + adaptive_quiet(self.gap_est, self.backoff);
 
         if (self.packets.len() as u32) >= total as u32 {
-            self.complete(socket);
+            self.complete(socket, fault);
             return;
         }
 
         if self.range_complete(start, count) {
-            self.advance(socket, start, count, total);
+            self.advance(socket, fault, start, count, total);
         }
     }
 
-    fn advance(&mut self, socket: &UdpSocket, start: u16, count: u16, total: u16) {
+    fn advance(&mut self, socket: &UdpSocket, fault: &mut FaultInjector, start: u16, count: u16, total: u16) {
         let next_start = start as u32 + count as u32;
         let remaining = total as u32 - next_start + 1;
         if remaining <= 0 {
-            self.complete(socket);
+            self.complete(socket, fault);
             return;
         }
         let next_count = (count as u32 * 2)
@@ -396,15 +474,15 @@ impl ReceiverTransfer {
             .min(remaining);
         self.range = Some((next_start as u16, next_count as u16));
         self.retry_count = 0;
-        self.quiet_deadline = Instant::now() + quiet_period();
-        self.send_ack(socket, (next_start as u16, next_count as u16));
+        self.quiet_deadline = Instant::now() + adaptive_quiet(self.gap_est, 0);
+        self.send_ack(socket, fault, (next_start as u16, next_count as u16));
         log::trace(&format!(
             "receiver {:#06x}: window {start}+{count} done, requesting ({next_start}, {next_count})",
             self.transfer_id
         ));
     }
 
-    fn complete(&mut self, socket: &UdpSocket) {
+    fn complete(&mut self, socket: &UdpSocket, fault: &mut FaultInjector) {
         let total = self.total.unwrap_or(0) as usize;
         let mut buffer = vec![0u8; total.saturating_mul(SEGMENT_PACKET_SIZE)];
         let mut final_size = 0usize;
@@ -449,14 +527,34 @@ impl ReceiverTransfer {
             kbps
         ));
 
-        self.send_complete(socket);
+        self.send_complete(socket, fault);
         self.outcome = Some(Ok(()));
         self.deadline = Instant::now() + COMPLETE_GRACE;
     }
 
-    pub fn on_tick(&mut self, socket: &UdpSocket, now: Instant) {
+    pub fn on_tick(&mut self, socket: &UdpSocket, fault: &mut FaultInjector, now: Instant) {
         if self.outcome.is_some() {
             return;
+        }
+
+        // No response at all yet: resend the request at half the first-
+        // response timeout so a single dropped request doesn't cost the
+        // whole budget (M5). Fresh budget after the resend.
+        if self.packets.is_empty() && !self.request_resent {
+            let timeout = Duration::from_millis(settings().first_timeout_ms);
+            if now >= self.started_at + timeout / 2 {
+                self.request_resent = true;
+                self.first_response_deadline = now + timeout;
+                let req = Message::SegmentRequest {
+                    transfer_id: self.transfer_id,
+                    filename: self.filename.clone(),
+                };
+                fault.send(socket, protocol::encode(&req), self.remote, now);
+                log::debug(&format!(
+                    "receiver {:#06x}: no response yet, resending request",
+                    self.transfer_id
+                ));
+            }
         }
 
         if now >= self.first_response_deadline && self.packets.is_empty() {
@@ -469,7 +567,9 @@ impl ReceiverTransfer {
 
         let mut acted = false;
         if now >= self.quiet_deadline {
-            self.quiet_deadline = now + quiet_period();
+            // Back off the quiet period so a burst spreads its retries.
+            self.backoff = (self.backoff + 1).min(4);
+            self.quiet_deadline = now + adaptive_quiet(self.gap_est, self.backoff);
             acted = true;
             if let Some((start, count)) = self.range {
                 if !self.range_complete(start, count) {
@@ -485,7 +585,7 @@ impl ReceiverTransfer {
                         "receiver {:#06x}: re-requesting range ({start},{count}) (retry {}/{RETRY_LIMIT})",
                         self.transfer_id, self.retry_count
                     ));
-                    self.send_ack(socket, (start, count));
+                    self.send_ack(socket, fault, (start, count));
                 }
             }
         }
@@ -502,6 +602,14 @@ pub struct TransferRegistry {
     segment_root: PathBuf,
     senders: HashMap<u16, SenderTransfer>,
     receivers: HashMap<u16, ReceiverTransfer>,
+    events: Vec<RegEvent>,
+}
+
+/// Outcomes the node layer turns into peer stats (M5).
+pub enum RegEvent {
+    Served { src: SocketAddr },
+    NotFound { src: SocketAddr },
+    SenderFailed { src: SocketAddr },
 }
 
 fn random_id() -> u16 {
@@ -519,7 +627,17 @@ impl TransferRegistry {
             segment_root,
             senders: HashMap::new(),
             receivers: HashMap::new(),
+            events: Vec::new(),
         }
+    }
+
+    pub fn segment_root(&self) -> &Path {
+        &self.segment_root
+    }
+
+    /// Take recorded serve outcomes (drained by the node layer).
+    pub fn drain_events(&mut self) -> Vec<RegEvent> {
+        std::mem::take(&mut self.events)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -543,26 +661,38 @@ impl TransferRegistry {
         }
     }
 
-    fn send_not_found(&self, socket: &UdpSocket, transfer_id: u16, src: SocketAddr) {
+    fn send_not_found(
+        &self,
+        socket: &UdpSocket,
+        fault: &mut FaultInjector,
+        transfer_id: u16,
+        src: SocketAddr,
+    ) {
         let msg = Message::SegmentNotFound { transfer_id };
-        let _ = socket.send_to(&protocol::encode(&msg), src);
+        fault.send(socket, protocol::encode(&msg), src, Instant::now());
     }
 
     /// Serve a SEGMENT_REQUEST from `src`.
     pub fn serve(
         &mut self,
         socket: &UdpSocket,
+        fault: &mut FaultInjector,
         transfer_id: u16,
         filename: &str,
         src: SocketAddr,
     ) {
         if !valid_filename(filename) {
             log::warn(&format!("rejecting invalid filename {filename:?} from {src}"));
-            self.send_not_found(socket, transfer_id, src);
+            self.events.push(RegEvent::NotFound { src });
+            self.send_not_found(socket, fault, transfer_id, src);
             return;
         }
         if self.active_count() >= MAX_CONCURRENT_TRANSFERS {
-            log::warn("transfer registry full — dropping segment request");
+            // Never silently drop: a dropped request looks like a dead peer
+            // to the requester and can cause false evictions.
+            log::warn("transfer registry full — answering NOT_FOUND");
+            self.events.push(RegEvent::NotFound { src });
+            self.send_not_found(socket, fault, transfer_id, src);
             return;
         }
 
@@ -574,6 +704,7 @@ impl TransferRegistry {
                     "serving {filename} to {src} (transfer {transfer_id:#06x}, {} packets)",
                     sender.total_packets
                 ));
+                self.events.push(RegEvent::Served { src });
                 self.senders.insert(transfer_id, sender);
             }
             Err(_) => {
@@ -581,7 +712,8 @@ impl TransferRegistry {
                     "{filename} not in {} — SEGMENT_NOT_FOUND",
                     self.segment_root.display()
                 ));
-                self.send_not_found(socket, transfer_id, src);
+                self.events.push(RegEvent::NotFound { src });
+                self.send_not_found(socket, fault, transfer_id, src);
             }
         }
     }
@@ -590,6 +722,7 @@ impl TransferRegistry {
     pub fn start_receiver(
         &mut self,
         socket: &UdpSocket,
+        fault: &mut FaultInjector,
         remote: SocketAddr,
         data_dir: &Path,
         filename: &str,
@@ -603,10 +736,7 @@ impl TransferRegistry {
             transfer_id: id,
             filename: filename.to_string(),
         };
-        if let Err(e) = socket.send_to(&protocol::encode(&req), remote) {
-            log::error(&format!("failed to send SEGMENT_REQUEST: {e}"));
-            return None;
-        }
+        fault.send(socket, protocol::encode(&req), remote, Instant::now());
         let receiver = ReceiverTransfer::new(id, remote, filename.to_string(), data_dir.to_path_buf());
         self.receivers.insert(id, receiver);
         Some(id)
@@ -615,6 +745,7 @@ impl TransferRegistry {
     pub fn on_content(
         &mut self,
         socket: &UdpSocket,
+        fault: &mut FaultInjector,
         transfer_id: u16,
         packet_number: u16,
         total_packets: u16,
@@ -622,7 +753,7 @@ impl TransferRegistry {
         src: SocketAddr,
     ) {
         if let Some(r) = self.receivers.get_mut(&transfer_id) {
-            r.on_content(socket, packet_number, total_packets, data);
+            r.on_content(socket, fault, packet_number, total_packets, data);
         } else {
             log::trace(&format!(
                 "SEGMENT_CONTENTS for unknown transfer {transfer_id:#06x} from {src}"
@@ -632,7 +763,6 @@ impl TransferRegistry {
 
     pub fn on_ack(
         &mut self,
-        socket: &UdpSocket,
         transfer_id: u16,
         ack_type: AckType,
         next_start: u16,
@@ -640,7 +770,7 @@ impl TransferRegistry {
         src: SocketAddr,
     ) {
         if let Some(sender) = self.senders.get_mut(&transfer_id) {
-            if sender.on_ack(socket, ack_type, next_start, next_count) {
+            if sender.on_ack(ack_type, next_start, next_count) {
                 log::info(&format!("transfer {transfer_id:#06x} complete — sender freed"));
                 self.senders.remove(&transfer_id);
             }
@@ -654,6 +784,7 @@ impl TransferRegistry {
     pub fn on_not_found(&mut self, _socket: &UdpSocket, transfer_id: u16) {
         if let Some(r) = self.receivers.get_mut(&transfer_id) {
             let filename = r.filename.clone();
+            r.mark_not_found();
             r.fail(format!("peer does not have {filename}"));
         } else {
             log::trace(&format!("NOT_FOUND for unknown transfer {transfer_id:#06x}"));
@@ -669,19 +800,31 @@ impl TransferRegistry {
         self.receivers.get(&id).map(ReceiverTransfer::unresponsive).unwrap_or(false)
     }
 
+    /// Whether the receiver failed because the peer lacks the segment.
+    pub fn receiver_not_found(&self, id: u16) -> bool {
+        self.receivers.get(&id).map(ReceiverTransfer::not_found).unwrap_or(false)
+    }
+
+    /// Milliseconds from request to first content packet, if it got that far.
+    pub fn receiver_first_packet_ms(&self, id: u16) -> Option<u64> {
+        self.receivers.get(&id).and_then(ReceiverTransfer::first_packet_latency_ms)
+    }
+
     pub fn remove_receiver(&mut self, id: u16) {
         self.receivers.remove(&id);
     }
 
     /// Advance all transfers whose timers have expired.
-    pub fn tick(&mut self, socket: &UdpSocket, now: Instant) {
+    pub fn tick(&mut self, socket: &UdpSocket, fault: &mut FaultInjector, now: Instant) {
         // Senders: chunk sends + ack timeouts (paced, non-blocking).
         let mut expired: Vec<u16> = Vec::new();
         for (id, sender) in self.senders.iter_mut() {
-            match sender.tick(socket, now) {
+            match sender.tick(socket, fault, now) {
                 Ok(()) => {}
                 Err(e) => {
                     log::warn(&e);
+                    let src = sender.remote;
+                    self.events.push(RegEvent::SenderFailed { src });
                     expired.push(*id);
                 }
             }
@@ -698,7 +841,7 @@ impl TransferRegistry {
                     done.push(*id);
                 }
             } else {
-                receiver.on_tick(socket, now);
+                receiver.on_tick(socket, fault, now);
             }
         }
         for id in done {

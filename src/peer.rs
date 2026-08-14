@@ -2,18 +2,24 @@
 //! manifest, discover other peers via peerlists, and pull missing segments
 //! from whichever peers have them — several in parallel. Also serves what
 //! it has to other nodes (via the shared Node dispatch).
+//!
+//! M5: source selection is score-weighted (peer ranking), peers preferred
+//! over the bootstrap once comparable, and eviction requires repeated
+//! unresponsiveness so a slow link isn't mistaken for a dead node.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use crate::fault::Rng;
 use crate::http;
 use crate::log;
-use crate::node::{Event, Node};
+use crate::node::{Event, Node, PullResult};
 use crate::protocol::{self, Message};
 use crate::transfer;
 
@@ -28,6 +34,9 @@ const FAIL_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
 /// Don't start more than this many concurrent pulls from one peer.
 const MAX_INFLIGHT_PER_PEER: usize = 2;
+/// Unresponsive pulls before a peer is evicted (M5: one timeout can just
+/// be a bad moment; three is a pattern).
+const EVICT_AFTER_UNRESPONSIVE: u32 = 3;
 
 /// An in-flight download: which file from which peer.
 struct ActiveJob {
@@ -52,10 +61,12 @@ pub fn run(
         data_dir.display()
     ));
 
+    let stats_sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(hp) = http_port {
         let root = data_dir.clone();
+        let stats = stats_sink.clone();
         thread::spawn(move || {
-            if let Err(e) = http::serve(root, hp) {
+            if let Err(e) = http::serve(root, hp, Some(stats)) {
                 log::error(&format!("http server failed: {e}"));
                 std::process::exit(1);
             }
@@ -67,14 +78,16 @@ pub fn run(
         name.to_string(),
         data_dir.join("live.m3u8"),
         data_dir.clone(),
+        crate::fault::FaultInjector::from_env(),
+        Some(stats_sink),
     );
 
     // --- protocol state ---
     let mut handshake_done = false;
-    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut next_poll = Instant::now() + MANIFEST_POLL_INTERVAL;
+    let mut next_handshake_retry = Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut next_poll = Instant::now();
     let mut poll_timeout: Option<Instant> = None;
-    let mut next_peerlist = Instant::now() + PEERLIST_POLL_INTERVAL;
+    let mut next_peerlist = Instant::now();
     let mut pending_handshakes: HashMap<SocketAddr, Instant> = HashMap::new();
 
     // --- job scheduler state ---
@@ -83,12 +96,14 @@ pub fn run(
     let mut queued: HashSet<String> = HashSet::new(); // queued or in-flight
     let mut tried: HashMap<String, HashSet<SocketAddr>> = HashMap::new();
     let mut failed_at: HashMap<String, Instant> = HashMap::new();
+    let mut unresponsive_hits: HashMap<SocketAddr, u32> = HashMap::new();
+    let mut rng = Rng::new(0);
 
     // Initial handshake with the bootstrap node.
     let hs = Message::HandshakeRequest {
         name: name.to_string(),
     };
-    node.socket.send_to(&protocol::encode(&hs), remote)?;
+    node.send(&protocol::encode(&hs), remote);
     log::info(&format!("sent HANDSHAKE_REQUEST to {remote}"));
 
     let mut buf = [0u8; 65536];
@@ -99,14 +114,13 @@ pub fn run(
             deadlines.push(d);
         }
         deadlines.extend(pending_handshakes.values().copied());
-        if handshake_done {
-            deadlines.push(next_poll);
-            deadlines.push(next_peerlist);
-            if let Some(t) = poll_timeout {
-                deadlines.push(t);
-            }
-        } else {
-            deadlines.push(handshake_deadline);
+        if !handshake_done {
+            deadlines.push(next_handshake_retry);
+        }
+        deadlines.push(next_poll);
+        deadlines.push(next_peerlist);
+        if let Some(t) = poll_timeout {
+            deadlines.push(t);
         }
         // Clamp zero (deadline already passed) to 1ns: set_read_timeout
         // rejects a 0-duration timeout on Linux; we want to tick immediately.
@@ -165,7 +179,7 @@ pub fn run(
                             let req = Message::HandshakeRequest {
                                 name: name.to_string(),
                             };
-                            let _ = node.socket.send_to(&protocol::encode(&req), peer);
+                            node.send(&protocol::encode(&req), peer);
                             log::debug(&format!("handshaking with discovered peer {peer}"));
                         }
                     }
@@ -183,12 +197,16 @@ pub fn run(
         node.tick(now);
         node.prune_peers(PEER_TTL, now);
 
-        if !handshake_done {
-            if now >= handshake_deadline {
-                log::error(&format!("handshake timed out — no reply from {remote}"));
-                std::process::exit(1);
-            }
-            continue;
+        // Keep retrying the bootstrap handshake until it lands (M5): a
+        // dropped first packet must not kill the peer. Manifest/peerlist
+        // polling is not gated on it — the bootstrap answers anyway.
+        if !handshake_done && now >= next_handshake_retry {
+            let req = Message::HandshakeRequest {
+                name: name.to_string(),
+            };
+            node.send(&protocol::encode(&req), remote);
+            log::warn(&format!("bootstrap handshake unanswered — retrying {remote}"));
+            next_handshake_retry = now + HANDSHAKE_TIMEOUT;
         }
 
         // Discovered peers that didn't answer: drop, retried on next list.
@@ -203,7 +221,7 @@ pub fn run(
 
         if now >= next_poll {
             let req = Message::ManifestRequest;
-            node.socket.send_to(&protocol::encode(&req), remote)?;
+            node.send(&protocol::encode(&req), remote);
             log::trace("sent MANIFEST_REQUEST");
             next_poll = now + MANIFEST_POLL_INTERVAL;
             poll_timeout = Some(now + MANIFEST_RESPONSE_TIMEOUT);
@@ -217,7 +235,7 @@ pub fn run(
 
         if now >= next_peerlist {
             let req = Message::PeerlistRequest;
-            node.socket.send_to(&protocol::encode(&req), remote)?;
+            node.send(&protocol::encode(&req), remote);
             log::trace("sent PEERLIST_REQUEST");
             next_peerlist = now + PEERLIST_POLL_INTERVAL;
         }
@@ -229,8 +247,11 @@ pub fn run(
             &mut queued,
             &mut tried,
             &mut failed_at,
+            &mut unresponsive_hits,
             &data_dir,
             local_addr,
+            remote,
+            &mut rng,
             now,
         );
     }
@@ -244,12 +265,15 @@ fn schedule_jobs(
     queued: &mut HashSet<String>,
     tried: &mut HashMap<String, HashSet<SocketAddr>>,
     failed_at: &mut HashMap<String, Instant>,
+    unresponsive_hits: &mut HashMap<SocketAddr, u32>,
     data_dir: &Path,
     local_addr: SocketAddr,
+    bootstrap: SocketAddr,
+    rng: &mut Rng,
     now: Instant,
 ) {
     // 1. Reap finished receivers.
-    let finished: Vec<(u16, ActiveJob, Result<(), String>, bool)> = {
+    let finished: Vec<(u16, ActiveJob, Result<(), String>, bool, bool, Option<u64>)> = {
         let mut v = Vec::new();
         for (id, job) in active.iter() {
             if let Some(outcome) = node.registry.receiver_outcome(*id) {
@@ -261,26 +285,48 @@ fn schedule_jobs(
                     },
                     outcome,
                     node.registry.receiver_unresponsive(*id),
+                    node.registry.receiver_not_found(*id),
+                    node.registry.receiver_first_packet_ms(*id),
                 ));
             }
         }
         v
     };
-    for (id, job, outcome, unresponsive) in finished {
+    for (id, job, outcome, unresponsive, not_found, latency) in finished {
         active.remove(&id);
         node.registry.remove_receiver(id);
-        match outcome {
-            Ok(()) => {
+        let result = if outcome.is_ok() {
+            PullResult::Ok
+        } else if unresponsive {
+            PullResult::Timeout
+        } else if not_found {
+            PullResult::NotFound
+        } else {
+            PullResult::Other
+        };
+        node.record_pull(job.peer, result, latency);
+        match result {
+            PullResult::Ok => {
                 log::info(&format!("segment {} saved", job.filename));
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);
+                unresponsive_hits.remove(&job.peer);
             }
-            Err(e) => {
-                log::warn(&format!("segment {} pull failed: {e}", job.filename));
+            _ => {
+                log::warn(&format!("segment {} pull failed: {}", job.filename, outcome.unwrap_err()));
                 if unresponsive {
-                    // Peer never answered — likely dead; stop sending it work.
-                    log::warn(&format!("evicting unresponsive peer {}", job.peer));
-                    node.peers.remove(&job.peer);
+                    // Peer never answered — count it; evict only after a
+                    // pattern (M5), so a burst or slow link isn't fatal.
+                    let hits = unresponsive_hits.entry(job.peer).or_insert(0);
+                    *hits += 1;
+                    if *hits >= EVICT_AFTER_UNRESPONSIVE {
+                        log::warn(&format!("evicting unresponsive peer {}", job.peer));
+                        node.peers.remove(&job.peer);
+                        unresponsive_hits.remove(&job.peer);
+                    }
+                } else {
+                    // Peer answered — it's alive; a bad moment is forgiven.
+                    unresponsive_hits.remove(&job.peer);
                 }
                 let untried = node.peers.iter().any(|(p, _)| {
                     *p != local_addr
@@ -304,11 +350,11 @@ fn schedule_jobs(
     // 2. Fill free slots.
     while active.len() < MAX_PARALLEL_DOWNLOADS {
         let Some(filename) = queue.pop_front() else { break };
-        let Some(peer) = pick_peer(node, active, tried, &filename, local_addr) else {
+        let Some(peer) = pick_peer(node, active, tried, &filename, local_addr, bootstrap, rng) else {
             queue.push_front(filename);
             break;
         };
-        match node.registry.start_receiver(&node.socket, peer, data_dir, &filename) {
+        match node.registry.start_receiver(&node.socket, &mut node.fault, peer, data_dir, &filename) {
             Some(id) => {
                 log::info(&format!("pulling {filename} from {peer} (transfer {id:#06x})"));
                 active.insert(
@@ -328,13 +374,17 @@ fn schedule_jobs(
     }
 }
 
-/// Choose the least-loaded peer that hasn't failed this job yet.
+/// Choose a peer for the next pull: score-weighted (peer ranking, M5),
+/// least-loaded, not already tried for this job, peers slightly preferred
+/// over the bootstrap once their scores are comparable.
 fn pick_peer(
     node: &Node,
     active: &HashMap<u16, ActiveJob>,
     tried: &HashMap<String, HashSet<SocketAddr>>,
     filename: &str,
     local_addr: SocketAddr,
+    bootstrap: SocketAddr,
+    rng: &mut Rng,
 ) -> Option<SocketAddr> {
     let tried_for = tried.get(filename);
     let inflight = |p: &SocketAddr| active.values().filter(|j| &j.peer == p).count();
@@ -349,14 +399,24 @@ fn pick_peer(
     if candidates.is_empty() {
         return None;
     }
-    let min = candidates.iter().map(inflight).min().unwrap();
-    let best: Vec<SocketAddr> = candidates.into_iter().filter(|p| inflight(p) == min).collect();
-    // Pseudo-random tiebreak so load spreads across peers.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Some(best[(nanos as usize) % best.len()])
+    let weight = |p: &SocketAddr| -> f64 {
+        let inflight = inflight(p) as f64;
+        let score = node.peer_stats.get(p).map(|s| s.score as f64).unwrap_or(50.0);
+        let mut w = (score + 1.0) / (inflight + 1.0);
+        if *p == bootstrap {
+            w *= 0.85; // slight bias toward peers sharing the load
+        }
+        w.max(0.001)
+    };
+    let total: f64 = candidates.iter().map(weight).sum();
+    let mut roll = (rng.next() as f64 / u64::MAX as f64) * total;
+    for p in candidates {
+        roll -= weight(&p);
+        if roll <= 0.0 {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Atomically write the manifest; returns true if the content changed.
@@ -371,20 +431,8 @@ fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Parse segment filenames out of an m3u8 playlist.
-fn parse_manifest(data: &[u8]) -> Vec<String> {
-    std::str::from_utf8(data)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| l.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn segment_count(data: &[u8]) -> usize {
-    parse_manifest(data).len()
+    transfer::parse_manifest(data).len()
 }
 
 /// Enqueue manifest segments that are missing locally and not already
@@ -396,7 +444,7 @@ fn sync_queue(
     queued: &mut HashSet<String>,
     failed_at: &HashMap<String, Instant>,
 ) {
-    for filename in parse_manifest(manifest) {
+    for filename in transfer::parse_manifest(manifest) {
         if !transfer::valid_filename(&filename) {
             continue;
         }

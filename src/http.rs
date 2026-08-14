@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::log;
@@ -16,15 +17,17 @@ use crate::transfer::valid_filename;
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
-/// Serve `root` over HTTP on 0.0.0.0:port. Blocks forever.
-pub fn serve(root: PathBuf, port: u16) -> io::Result<()> {
+/// Serve `root` over HTTP on 0.0.0.0:port. Blocks forever. When `stats` is
+/// given, GET /peers and /stats return the node's live stats snapshot (M5).
+pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<Vec<String>>>>) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     log::info(&format!("http: serving {} on 0.0.0.0:{port}", root.display()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let root = root.clone();
-                thread::spawn(move || handle_connection(root, stream));
+                let stats = stats.clone();
+                thread::spawn(move || handle_connection(root, stats, stream));
             }
             Err(e) => log::warn(&format!("http: accept failed: {e}")),
         }
@@ -32,7 +35,7 @@ pub fn serve(root: PathBuf, port: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(root: PathBuf, mut stream: TcpStream) {
+fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<Vec<String>>>>, mut stream: TcpStream) {
     // Read until the end of headers (or a sane cap).
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -69,6 +72,25 @@ fn handle_connection(root: PathBuf, mut stream: TcpStream) {
 
     // Strip query string and leading slash; validate the name.
     let name = target.split('?').next().unwrap_or_default().trim_start_matches('/');
+
+    // M5: live stats routes (peer ranking, counters, fault totals).
+    if name == "peers" || name == "stats" {
+        if let Some(stats) = stats {
+            let lines = stats.lock().map(|g| g.join("\n")).unwrap_or_default();
+            let body = if lines.is_empty() {
+                "node stats not ready\n".to_string()
+            } else {
+                format!("{lines}\n")
+            };
+            respond(&mut stream, 200, "OK", "text/plain", body.as_bytes(), head_only);
+            return;
+        }
+    }
+    if name == "health" {
+        respond(&mut stream, 200, "OK", "text/plain", b"ok\n", head_only);
+        return;
+    }
+
     if !valid_filename(name) {
         respond(&mut stream, 404, "Not Found", "text/plain", b"not found\n", head_only);
         return;
