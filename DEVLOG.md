@@ -56,3 +56,22 @@ Running log of problems observed and how they were fixed, milestone N
    `&str` was needed (two compile errors). Fixed.
 4. The `Event::PeerlistResponse` type changed to `Vec<(SocketAddr, u8)>`
    but node.rs's Event enum wasn't updated — type error caught at compile.
+
+## LAN beacon self-discovery bug (2025-08-15) — FIXED
+
+**Symptom:** the loopback lab showed `discovered peer peer-1 at
+45.87.251.232:4444 (ping)` — a peer registered ITSELF as a peer at the
+machine's public IP.
+
+**Cause:** the kernel delivers a node's own UDP broadcast back to its own
+socket (loopback of broadcast on the host's interface). The self-guard
+compared `src == local_addr` (0.0.0.0:4444) which never matches the echo's
+source (machine's external IP).
+
+**Fix:** PING payload now carries a random per-node nonce (4 B) before the
+name; a node ignores any PING whose nonce equals its own — own echoes are
+recognized regardless of which IP they arrive from. Also avoids
+self-registration polluting the peers map and `pick_peer`.
+
+**Verified:** no more self-discovery in the lab; 0 failures; path=fresh on
+/peers.

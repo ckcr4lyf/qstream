@@ -141,6 +141,9 @@ pub struct Node {
     pub my_public: Option<SocketAddr>,
     /// Our claimed public endpoint (UPnP mapping, N4), if any.
     pub claimed: Option<SocketAddr>,
+    /// Random per-node nonce stamped in PINGs; own broadcast echoes carry it
+    /// back and are ignored (DEVLOG: beacon self-discovery bug).
+    beacon_nonce: u32,
     /// Claimed endpoints reported by peers (N1): peer addr -> claimed.
     claims: HashMap<SocketAddr, SocketAddr>,
     /// Ping/pong reachability per peer address (N2).
@@ -181,6 +184,7 @@ impl Node {
             log::info(&fault.summary());
         }
         let local_addr = socket.local_addr().unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let beacon_nonce = crate::fault::Rng::new(0).next() as u32;
         Node {
             socket,
             name,
@@ -192,6 +196,7 @@ impl Node {
             fault,
             my_public: None,
             claimed: None,
+            beacon_nonce,
             claims: HashMap::new(),
             paths: HashMap::new(),
             local_addr,
@@ -218,8 +223,9 @@ impl Node {
         log::info(&format!("UPnP mapping claimed: {addr}"));
     }
 
-    pub fn path_state(&self, addr: SocketAddr) -> Option<&PathState> {
-        self.paths.get(&addr)
+    /// Is `addr` a LAN path (discovered via beacon)?
+    pub fn is_lan_path(&self, addr: SocketAddr) -> bool {
+        self.paths.get(&addr).map(|p| p.lan).unwrap_or(false)
     }
 
     /// Is the direct path to `addr` fresh (PONG within PATH_FRESH)?
@@ -234,10 +240,7 @@ impl Node {
         let name = self.peers.get(&addr).map(|p| p.name.clone());
         if let Some(name) = name {
             for (a, info) in &self.peers {
-                if info.name == name
-                    && a != &addr
-                    && self.paths.get(a).map(|p| p.lan).unwrap_or(false)
-                {
+                if info.name == name && a != &addr && self.is_lan_path(*a) {
                     return *a;
                 }
             }
@@ -401,6 +404,7 @@ impl Node {
         if now >= self.next_ping {
             self.next_ping = now + PING_INTERVAL;
             let ping = Message::Ping {
+                nonce: self.beacon_nonce,
                 name: self.name.clone(),
             };
             for addr in self.peers.keys().copied().collect::<Vec<_>>() {
@@ -415,6 +419,7 @@ impl Node {
         if self.role == "peer" && now >= self.next_beacon {
             self.next_beacon = now + BEACON_INTERVAL;
             let ping = Message::Ping {
+                nonce: self.beacon_nonce,
                 name: self.name.clone(),
             };
             let broadcast = SocketAddr::from(([255, 255, 255, 255], self.local_addr.port()));
@@ -543,10 +548,15 @@ impl Node {
         let mut ranked: Vec<(&SocketAddr, &PeerStat)> = self.peer_stats.iter().collect();
         ranked.sort_by(|a, b| b.1.score.cmp(&a.1.score).then(a.0.cmp(b.0)));
         for (addr, s) in ranked {
+            let path = match self.paths.get(addr) {
+                Some(p) if p.lan => "lan".to_string(),
+                Some(p) if p.fresh(now) => "fresh".to_string(),
+                _ => "stale".to_string(),
+            };
             lines.push(format!(
-                "peer {} {} score={} pulls={} nf_pulls={} timeouts={} other_fails={} served={} nf_served={} sender_fails={} latency={}ms",
+                "peer {} {} score={} pulls={} nf_pulls={} timeouts={} other_fails={} served={} nf_served={} sender_fails={} latency={}ms path={}",
                 s.name, addr, s.score, s.pulls, s.nf_pulls, s.timeouts, s.other_fails,
-                s.served, s.nf_served, s.sender_fails, s.latency_ms
+                s.served, s.nf_served, s.sender_fails, s.latency_ms, path
             ));
         }
         if self.fault.enabled() {
@@ -753,9 +763,14 @@ impl Node {
                 self.my_public = Some(observed);
                 Event::HandshakeResponse { src, name }
             }
-            Message::Ping { name } => {
+            Message::Ping { nonce, name } => {
+                if nonce == self.beacon_nonce {
+                    // Our own broadcast echo — the kernel delivers a
+                    // broadcast back to the sender's socket (DEVLOG).
+                    return Event::None;
+                }
                 if src == self.local_addr {
-                    return Event::None; // our own broadcast beacon
+                    return Event::None;
                 }
                 let known = self.peers.contains_key(&src);
                 if !known {

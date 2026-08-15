@@ -110,9 +110,10 @@ pub enum Message {
     PeerlistRequest,
     /// PEERLIST_RESPONSE — payload: packed (ip:port) entries + flags byte.
     PeerlistResponse { peers: Vec<(SocketAddr, u8)> },
-    /// PING — payload: node name (UTF-8, may be empty). Doubles as LAN
-    /// beacon when broadcast; a PONG proves the direct path works (N2).
-    Ping { name: String },
+    /// PING — payload: beacon nonce (4 B) + node name (UTF-8). Doubles as
+    /// LAN beacon when broadcast; a PONG proves the direct path works (N2).
+    /// The nonce lets a node recognize (and ignore) its own broadcast echo.
+    Ping { nonce: u32, name: String },
     /// PONG — no payload.
     Pong,
 }
@@ -243,7 +244,11 @@ pub fn encode(message: &Message) -> Vec<u8> {
         }
         Message::PeerlistRequest => Vec::new(),
         Message::PeerlistResponse { peers } => encode_peers(peers),
-        Message::Ping { name } => name.as_bytes().to_vec(),
+        Message::Ping { nonce, name } => {
+            let mut p = nonce.to_be_bytes().to_vec();
+            p.extend_from_slice(name.as_bytes());
+            p
+        }
         Message::Pong => Vec::new(),
     };
 
@@ -343,9 +348,19 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::PeerlistResponse => Message::PeerlistResponse {
             peers: decode_peers(payload)?,
         },
-        MessageType::Ping => Message::Ping {
-            name: utf8_name(payload)?,
-        },
+        MessageType::Ping => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::TruncatedPayload {
+                    declared: payload.len() as u16,
+                    actual: 0,
+                });
+            }
+            let nonce = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Message::Ping {
+                nonce,
+                name: utf8_name(&payload[4..])?,
+            }
+        }
         MessageType::Pong => Message::Pong,
     })
 }
@@ -446,6 +461,7 @@ mod tests {
     #[test]
     fn roundtrip_ping_pong() {
         let ping = Message::Ping {
+            nonce: 0xDEADBEEF,
             name: "peer-1".to_string(),
         };
         assert_eq!(decode(&encode(&ping)).unwrap(), ping);
@@ -597,10 +613,12 @@ mod tests {
     #[test]
     fn ping_wire_format() {
         let msg = Message::Ping {
+            nonce: 0xDEADBEEF,
             name: "peer-1".to_string(),
         };
         let mut expected: Vec<u8> = vec![
-            0x51, 0x53, 0x54, 0x03, 0x60, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x51, 0x53, 0x54, 0x03, 0x60, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xDE, 0xAD, 0xBE, 0xEF, // nonce
         ];
         expected.extend_from_slice(b"peer-1");
         assert_eq!(encode(&msg), expected);
