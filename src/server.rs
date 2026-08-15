@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::fault::FaultInjector;
 use crate::http;
 use crate::log;
-use crate::node::Node;
+use crate::node::{Node, StatsSnapshot};
 
 pub fn run(
     port: u16,
@@ -40,7 +40,10 @@ pub fn run(
 
     if let Some(hp) = http_port {
         let root = segment_root.clone();
-        let stats: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stats: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot {
+            lines: Vec::new(),
+            json: String::new(),
+        }));
         let stats_http = stats.clone();
         thread::spawn(move || {
             if let Err(e) = http::serve(root, hp, Some(stats_http)) {
@@ -51,6 +54,7 @@ pub fn run(
         let mut node = Node::new(
             socket,
             name.to_string(),
+            "master",
             manifest_path,
             segment_root,
             FaultInjector::from_env(),
@@ -62,6 +66,7 @@ pub fn run(
         let mut node = Node::new(
             socket,
             name.to_string(),
+            "master",
             manifest_path,
             segment_root,
             FaultInjector::from_env(),

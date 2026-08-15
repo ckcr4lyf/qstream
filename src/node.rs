@@ -90,9 +90,16 @@ impl PeerStat {
     }
 }
 
+/// Shared stats snapshot served at /peers (text) and /stats (JSON).
+pub struct StatsSnapshot {
+    pub lines: Vec<String>,
+    pub json: String,
+}
+
 pub struct Node {
     pub socket: UdpSocket,
     pub name: String,
+    pub role: &'static str,
     pub manifest_path: PathBuf,
     pub registry: TransferRegistry,
     /// Peers we know about (handshaked or discovered), keyed by address.
@@ -103,21 +110,28 @@ pub struct Node {
     pub fault: FaultInjector,
     started: Instant,
     downloaded_total: u64,
+    downloaded_bytes: u64,
+    served_total: u64,
+    served_bytes: u64,
+    /// Pending pull queue depth + in-flight jobs (peer mode; set by peer.rs).
+    pub queue_depth: u64,
+    pub inflight: u64,
     retention_secs: u64,
     next_snapshot: Instant,
     next_rank_log: Instant,
     next_prune: Instant,
-    stats_sink: Option<Arc<Mutex<Vec<String>>>>,
+    stats_sink: Option<Arc<Mutex<StatsSnapshot>>>,
 }
 
 impl Node {
     pub fn new(
         socket: UdpSocket,
         name: String,
+        role: &'static str,
         manifest_path: PathBuf,
         segment_root: PathBuf,
         fault: FaultInjector,
-        stats_sink: Option<Arc<Mutex<Vec<String>>>>,
+        stats_sink: Option<Arc<Mutex<StatsSnapshot>>>,
     ) -> Node {
         let retention_secs = std::env::var("QSTREAM_RETENTION_SECS")
             .ok()
@@ -129,6 +143,7 @@ impl Node {
         Node {
             socket,
             name,
+            role,
             manifest_path,
             registry: TransferRegistry::new(segment_root),
             peers: HashMap::new(),
@@ -136,6 +151,11 @@ impl Node {
             fault,
             started: Instant::now(),
             downloaded_total: 0,
+            downloaded_bytes: 0,
+            served_total: 0,
+            served_bytes: 0,
+            queue_depth: 0,
+            inflight: 0,
             retention_secs,
             next_snapshot: Instant::now() + Duration::from_secs(5),
             next_rank_log: Instant::now() + Duration::from_secs(60),
@@ -189,7 +209,13 @@ impl Node {
     }
 
     /// Record how a pull from `peer` ended (requester-side ranking input).
-    pub fn record_pull(&mut self, peer: SocketAddr, result: PullResult, latency_ms: Option<u64>) {
+    pub fn record_pull(
+        &mut self,
+        peer: SocketAddr,
+        result: PullResult,
+        latency_ms: Option<u64>,
+        bytes: u64,
+    ) {
         let name = self.peers.get(&peer).map(|p| p.name.clone()).unwrap_or_else(|| peer.to_string());
         let stat = self.peer_stats.entry(peer).or_insert_with(|| PeerStat::new(name));
         stat.last_seen = Instant::now();
@@ -205,6 +231,7 @@ impl Node {
                     }
                 }
                 self.downloaded_total += 1;
+                self.downloaded_bytes += bytes;
             }
             PullResult::NotFound => {
                 // "Doesn't have it yet" is availability churn (everyone asks
@@ -224,13 +251,15 @@ impl Node {
     }
 
     /// Record how a serve to `peer` ended (server-side ranking input).
-    pub fn record_serve(&mut self, peer: SocketAddr, result: ServeResult) {
+    pub fn record_serve(&mut self, peer: SocketAddr, result: ServeResult, bytes: u64) {
         let name = self.peers.get(&peer).map(|p| p.name.clone()).unwrap_or_else(|| peer.to_string());
         let stat = self.peer_stats.entry(peer).or_insert_with(|| PeerStat::new(name));
         match result {
             ServeResult::Served => {
                 stat.served += 1;
                 stat.adjust(2);
+                self.served_total += 1;
+                self.served_bytes += bytes;
             }
             ServeResult::NotFound => {
                 stat.nf_served += 1;
@@ -257,9 +286,9 @@ impl Node {
         // Turn serve outcomes into peer stats.
         for event in self.registry.drain_events() {
             match event {
-                RegEvent::Served { src } => self.record_serve(src, ServeResult::Served),
-                RegEvent::NotFound { src } => self.record_serve(src, ServeResult::NotFound),
-                RegEvent::SenderFailed { src } => self.record_serve(src, ServeResult::SenderFailed),
+                RegEvent::Served { src, bytes } => self.record_serve(src, ServeResult::Served, bytes),
+                RegEvent::NotFound { src } => self.record_serve(src, ServeResult::NotFound, 0),
+                RegEvent::SenderFailed { src } => self.record_serve(src, ServeResult::SenderFailed, 0),
             }
         }
 
@@ -305,7 +334,8 @@ impl Node {
         }
     }
 
-    /// Refresh the shared stats snapshot the HTTP server serves at /peers.
+    /// Refresh the shared stats snapshot the HTTP server serves at /peers
+    /// and /stats.
     fn publish_snapshot(&mut self, now: Instant) {
         if now < self.next_snapshot {
             return;
@@ -313,9 +343,69 @@ impl Node {
         self.next_snapshot = now + Duration::from_secs(5);
         if let Some(sink) = &self.stats_sink {
             if let Ok(mut guard) = sink.lock() {
-                *guard = self.stats_lines(now);
+                guard.lines = self.stats_lines(now);
+                guard.json = self.stats_json(now);
             }
         }
+    }
+
+    fn store_bytes(&self) -> u64 {
+        let root = self.registry.segment_root();
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.starts_with("seg_") && n.ends_with(".ts")
+                    })
+                    .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Newest segment number in the local manifest copy (the live edge the
+    /// node knows about).
+    fn manifest_edge(&self) -> u64 {
+        std::fs::read(&self.manifest_path)
+            .ok()
+            .and_then(|d| transfer::parse_manifest(&d).into_iter().next_back())
+            .and_then(|name| {
+                name.strip_prefix("seg_")
+                    .and_then(|n| n.strip_suffix(".ts"))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// (count, newest segment number) in the local store.
+    fn store_segments(&self) -> (u64, u64) {
+        let root = self.registry.segment_root();
+        let mut count = 0u64;
+        let mut newest = 0u64;
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(rest) = name.strip_prefix("seg_").and_then(|n| n.strip_suffix(".ts")) {
+                    if let Ok(num) = rest.parse::<u64>() {
+                        count += 1;
+                        newest = newest.max(num);
+                    }
+                }
+            }
+        }
+        (count, newest)
+    }
+
+    fn rss_bytes() -> u64 {
+        // /proc/self/statm: size resident shared text lib data dt — RSS is
+        // the second field, in pages.
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1).map(|p| p.parse::<u64>().unwrap_or(0)))
+            .map(|pages| pages * 4096)
+            .unwrap_or(0)
     }
 
     fn stats_lines(&self, now: Instant) -> Vec<String> {
@@ -340,6 +430,64 @@ impl Node {
             ));
         }
         lines
+    }
+
+    /// JSON stats document for GET /stats (M5). Hand-rolled JSON — std has
+    /// no serializer; all values are numeric or escaped strings.
+    fn stats_json(&self, now: Instant) -> String {
+        let uptime = now.duration_since(self.started).as_secs();
+        let mut ranked: Vec<(&SocketAddr, &PeerStat)> = self.peer_stats.iter().collect();
+        ranked.sort_by(|a, b| b.1.score.cmp(&a.1.score).then(a.0.cmp(b.0)));
+        let peers_json: Vec<String> = ranked
+            .iter()
+            .map(|(addr, s)| {
+                format!(
+                    "{{\"name\":\"{}\",\"addr\":\"{}\",\"score\":{},\"pulls\":{},\"nf_pulls\":{},\"timeouts\":{},\"served\":{},\"nf_served\":{},\"latency_ms\":{}}}",
+                    json_escape(&s.name),
+                    addr,
+                    s.score,
+                    s.pulls,
+                    s.nf_pulls,
+                    s.timeouts,
+                    s.served,
+                    s.nf_served,
+                    s.latency_ms
+                )
+            })
+            .collect();
+        let fault_json = if self.fault.enabled() {
+            format!(
+                "\"fault\":{{\"dropped\":{},\"emitted\":{}}}",
+                self.fault.stats.dropped, self.fault.stats.emitted
+            )
+        } else {
+            "\"fault\":null".to_string()
+        };
+        let (store_count, local_newest) = self.store_segments();
+        let edge = self.manifest_edge();
+        format!(
+            "{{\"version\":\"{}\",\"node\":\"{}\",\"role\":\"{}\",\"uptime_secs\":{},\"peers_in_swarm\":{},\"peers\":[{}],\"downloaded\":{{\"segments\":{},\"bytes\":{}}},\"uploaded\":{{\"segments\":{},\"bytes\":{}}},\"store_bytes\":{},\"store_segments\":{},\"edge_segment\":{},\"local_newest\":{},\"catch_up\":{},\"active_transfers\":{},\"queue_depth\":{},\"inflight\":{},{},\"rss_bytes\":{}}}",
+            env!("CARGO_PKG_VERSION"),
+            json_escape(&self.name),
+            self.role,
+            uptime,
+            self.peers.len(),
+            peers_json.join(","),
+            self.downloaded_total,
+            self.downloaded_bytes,
+            self.served_total,
+            self.served_bytes,
+            self.store_bytes(),
+            store_count,
+            edge,
+            local_newest,
+            edge.saturating_sub(local_newest),
+            self.registry.active_count(),
+            self.queue_depth,
+            self.inflight,
+            fault_json,
+            Self::rss_bytes()
+        )
     }
 
     fn log_ranking(&mut self, now: Instant) {
@@ -461,5 +609,34 @@ impl Node {
                 Event::None
             }
         }
+    }
+}
+
+/// Minimal JSON string escaping for the hand-rolled stats document.
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_escape_handles_specials() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
     }
 }

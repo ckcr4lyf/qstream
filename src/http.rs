@@ -13,13 +13,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::log;
+use crate::node::StatsSnapshot;
 use crate::transfer::valid_filename;
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
 /// Serve `root` over HTTP on 0.0.0.0:port. Blocks forever. When `stats` is
-/// given, GET /peers and /stats return the node's live stats snapshot (M5).
-pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<Vec<String>>>>) -> io::Result<()> {
+/// given, GET /peers returns the ranking text and /stats returns the JSON
+/// stats document (M5).
+pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<StatsSnapshot>>>) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     log::info(&format!("http: serving {} on 0.0.0.0:{port}", root.display()));
     for stream in listener.incoming() {
@@ -35,7 +37,7 @@ pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<Vec<String>>>>) -
     Ok(())
 }
 
-fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<Vec<String>>>>, mut stream: TcpStream) {
+fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mut stream: TcpStream) {
     // Read until the end of headers (or a sane cap).
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -73,16 +75,28 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<Vec<String>>>>, mut 
     // Strip query string and leading slash; validate the name.
     let name = target.split('?').next().unwrap_or_default().trim_start_matches('/');
 
-    // M5: live stats routes (peer ranking, counters, fault totals).
-    if name == "peers" || name == "stats" {
+    // M5: live stats routes.
+    if name == "peers" {
         if let Some(stats) = stats {
-            let lines = stats.lock().map(|g| g.join("\n")).unwrap_or_default();
-            let body = if lines.is_empty() {
+            let body = stats.lock().map(|g| g.lines.join("\n")).unwrap_or_default();
+            let body = if body.is_empty() {
                 "node stats not ready\n".to_string()
             } else {
-                format!("{lines}\n")
+                format!("{body}\n")
             };
             respond(&mut stream, 200, "OK", "text/plain", body.as_bytes(), head_only);
+            return;
+        }
+    }
+    if name == "stats" {
+        if let Some(stats) = stats {
+            let body = stats.lock().map(|g| g.json.clone()).unwrap_or_default();
+            let body = if body.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{body}\n")
+            };
+            respond(&mut stream, 200, "OK", "application/json", body.as_bytes(), head_only);
             return;
         }
     }

@@ -289,6 +289,7 @@ pub struct ReceiverTransfer {
     last_arrival: Option<Instant>,
     first_packet_latency: Option<u64>,
     request_resent: bool,
+    saved_bytes: Option<u64>,
 }
 
 impl ReceiverTransfer {
@@ -320,6 +321,7 @@ impl ReceiverTransfer {
             last_arrival: None,
             first_packet_latency: None,
             request_resent: false,
+            saved_bytes: None,
         }
     }
 
@@ -362,6 +364,11 @@ impl ReceiverTransfer {
     /// Milliseconds from request to first content packet.
     pub fn first_packet_latency_ms(&self) -> Option<u64> {
         self.first_packet_latency
+    }
+
+    /// Bytes written to disk once complete.
+    pub fn saved_bytes(&self) -> Option<u64> {
+        self.saved_bytes
     }
 
     fn recompute_deadline(&mut self) {
@@ -518,6 +525,7 @@ impl ReceiverTransfer {
         } else {
             0
         };
+        self.saved_bytes = Some(final_size as u64);
         log::info(&format!(
             "downloaded {} ({} bytes, {} packets, {}ms, {} KB/s)",
             self.filename,
@@ -607,7 +615,7 @@ pub struct TransferRegistry {
 
 /// Outcomes the node layer turns into peer stats (M5).
 pub enum RegEvent {
-    Served { src: SocketAddr },
+    Served { src: SocketAddr, bytes: u64 },
     NotFound { src: SocketAddr },
     SenderFailed { src: SocketAddr },
 }
@@ -699,12 +707,13 @@ impl TransferRegistry {
         let filepath = self.segment_root.join(filename);
         match fs::read(&filepath) {
             Ok(file) => {
+                let bytes = file.len() as u64;
                 let sender = SenderTransfer::new(transfer_id, src, file);
                 log::info(&format!(
                     "serving {filename} to {src} (transfer {transfer_id:#06x}, {} packets)",
                     sender.total_packets
                 ));
-                self.events.push(RegEvent::Served { src });
+                self.events.push(RegEvent::Served { src, bytes });
                 self.senders.insert(transfer_id, sender);
             }
             Err(_) => {
@@ -808,6 +817,11 @@ impl TransferRegistry {
     /// Milliseconds from request to first content packet, if it got that far.
     pub fn receiver_first_packet_ms(&self, id: u16) -> Option<u64> {
         self.receivers.get(&id).and_then(ReceiverTransfer::first_packet_latency_ms)
+    }
+
+    /// Bytes written to disk for a completed receiver.
+    pub fn receiver_saved_bytes(&self, id: u16) -> Option<u64> {
+        self.receivers.get(&id).and_then(ReceiverTransfer::saved_bytes)
     }
 
     pub fn remove_receiver(&mut self, id: u16) {

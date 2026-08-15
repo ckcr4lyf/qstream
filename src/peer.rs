@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::fault::Rng;
 use crate::http;
 use crate::log;
-use crate::node::{Event, Node, PullResult};
+use crate::node::{Event, Node, PullResult, StatsSnapshot};
 use crate::protocol::{self, Message};
 use crate::transfer;
 
@@ -66,7 +66,10 @@ pub fn run(
         data_dir.display()
     ));
 
-    let stats_sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stats_sink: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot {
+        lines: Vec::new(),
+        json: String::new(),
+    }));
     if let Some(hp) = http_port {
         let root = data_dir.clone();
         let stats = stats_sink.clone();
@@ -81,6 +84,7 @@ pub fn run(
     let mut node = Node::new(
         socket,
         name.to_string(),
+        "peer",
         data_dir.join("live.m3u8"),
         data_dir.clone(),
         crate::fault::FaultInjector::from_env(),
@@ -265,6 +269,8 @@ pub fn run(
             &mut rng,
             now,
         );
+        node.queue_depth = pull_queue.len() as u64;
+        node.inflight = active.len() as u64;
     }
 }
 
@@ -284,7 +290,7 @@ fn schedule_jobs(
     now: Instant,
 ) {
     // 1. Reap finished receivers.
-    let finished: Vec<(u16, ActiveJob, Result<(), String>, bool, bool, Option<u64>)> = {
+    let finished: Vec<(u16, ActiveJob, Result<(), String>, bool, bool, Option<u64>, Option<u64>)> = {
         let mut v = Vec::new();
         for (id, job) in active.iter() {
             if let Some(outcome) = node.registry.receiver_outcome(*id) {
@@ -298,12 +304,13 @@ fn schedule_jobs(
                     node.registry.receiver_unresponsive(*id),
                     node.registry.receiver_not_found(*id),
                     node.registry.receiver_first_packet_ms(*id),
+                    node.registry.receiver_saved_bytes(*id),
                 ));
             }
         }
         v
     };
-    for (id, job, outcome, unresponsive, not_found, latency) in finished {
+    for (id, job, outcome, unresponsive, not_found, latency, bytes) in finished {
         active.remove(&id);
         if outcome.is_ok() {
             // Let the registry keep the receiver in grace (COMPLETE_GRACE)
@@ -320,7 +327,7 @@ fn schedule_jobs(
         } else {
             PullResult::Other
         };
-        node.record_pull(job.peer, result, latency);
+        node.record_pull(job.peer, result, latency, bytes.unwrap_or(0));
         match result {
             PullResult::Ok => {
                 log::info(&format!("segment {} saved", job.filename));
