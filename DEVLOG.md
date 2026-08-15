@@ -75,3 +75,44 @@ self-registration polluting the peers map and `pick_peer`.
 
 **Verified:** no more self-discovery in the lab; 0 failures; path=fresh on
 /peers.
+
+## NAT lab bring-up (2025-08-15) — four real bugs, all fixed
+
+The lab emulates home NATs with netns + iptables: each "home" is a netns
+with its own SNAT (symmetric-style, port-preserving) or DNAT (full cone).
+Master sits on the host at a public-ish address (10.99.0.1).
+
+1. **User-defined iptables chains fail on nf_tables** ("Invalid argument"
+   on the jump rule) — switched to the built-in chains.
+2. **teardown can't delete a netns with running processes** — devices
+   linger and the next setup breaks ("File exists" cascades). Fixed:
+   teardown kills qstream first.
+3. **SNAT must live inside the netns, not on the host**: packets destined
+   to a LOCAL process (the master) skip the host's POSTROUTING, so host
+   SNAT never applied to master-bound traffic. Moved NAT into each home
+   netns (more realistic anyway).
+4. **`multiple -d flags not allowed`** in iptables v1.8.7 — the SNAT
+   exclusion for broadcasts failed silently, so (a) the master saw private
+   addresses and (b) beacons got NATed. Fixed with a RETURN rule for
+   255.255.255.255 before the SNAT rule.
+5. **ARP blackholes replies to NAT pseudo-addresses**: routes
+   `10.99.0.x/32 dev veth` are scope-link and need ARP; no one answers
+   ARP for a NAT virtual IP, so every reply from the master vanished.
+   Fixed with `ip neigh ... nud permanent` (static neighbor to the home's
+   veth MAC) + pinned route src 10.99.0.1 (conntrack reverse-translation
+   requires replies to come from the address the peer sent to).
+6. **The host's pre-existing MASQUERADE (WAN-only, oifname ens3) is
+   harmless** — left untouched.
+
+With those fixed, the whole §3 matrix passes in the lab:
+
+- NATed peer pulls from master: works (receiver-driven; request opens the
+  path, sender replies to src).
+- Same-LAN peers (home1↔home2, one L2 domain): LAN beacon discovers the
+  private address (10.0.0.x) and transfers stay direct — no NAT hop.
+- Cross-NAT peers (home1↔cone1, different L2): transfers flow via public
+  endpoints through both NATs; per-destination SNAT ports are re-keyed on
+  first PING contact (the re-key fix), e.g. cone1 served home1 from
+  10.99.0.2:43358 — a port the master never saw.
+- 0 timeouts / 0 incomplete across all three homes; only trial NOT_FOUND
+  churn. Handshakes complete, all paths fresh.
