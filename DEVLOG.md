@@ -145,3 +145,24 @@ every action. Verified end-to-end against `upnp::try_map`:
 - The host's pre-existing MASQUERADE (VPS) was WAN-only and harmless, but
   teaching the lab this lesson took a while: check for ambient NAT rules
   before blaming your own setup.
+
+## Remote peer vs master's loopback swarm (2025-08-15) — FIXED
+
+**Symptom:** the home peer (real public IP, UPnP-mapped) logged endless
+`no handshake reply from 127.0.0.1:4445-4448 — skipping`.
+
+**Cause:** the master advertises each peer at the endpoint IT observes. In
+the lab that's 127.0.0.1 — meaningless to a remote peer (its own loopback).
+The requester wasted handshakes into the void.
+
+**Fix (both sides):** `remote_public()` — an endpoint is globally reachable
+iff not loopback and not RFC1918/link-local. The master's peerlist reply
+drops loopback/private entries for remote (public) requesters; the requester
+skips such entries when its own observed endpoint is public. The loopback
+lab and same-LAN cases are unaffected (loopback/private requester = no
+filtering).
+
+**Unexpected find:** despite the noise, the remote peer still got served —
+the loopback peers initiated handshakes toward it (via its UPnP endpoint),
+and it registered them at the host's PUBLIC IP:port (45.87.251.232:4448),
+which is locally delivered — so cross-topology transfers worked anyway.

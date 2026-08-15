@@ -188,8 +188,20 @@ pub fn run(
                         poll_timeout = None;
                     }
                     Event::PeerlistResponse { peers } => {
+                        // We're "remote" if our observed public endpoint is
+                        // globally reachable; then the master's loopback/
+                        // private peers (its local swarm) are unreachable
+                        // from here — skip them instead of handshaking into
+                        // the void (DEVLOG: home peer vs 127.0.0.1 entries).
+                        let remote_me = node
+                            .my_public
+                            .map(|a| crate::node::remote_public(a))
+                            .unwrap_or(false);
                         for (peer, flags) in peers {
                             if peer == local_addr || peer.port() == 0 {
+                                continue;
+                            }
+                            if remote_me && !crate::node::remote_public(peer) {
                                 continue;
                             }
                             // Same public IP as us: same NAT/LAN — the LAN

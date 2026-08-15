@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -840,11 +840,16 @@ impl Node {
                 // Reply with our view, excluding the requester. Each entry
                 // carries flags: UPNP_MAPPED if the peer's claimed mapping
                 // is what we observe, SAME_IP if it shares the requester's
-                // public IP (likely the same NAT/LAN, N1/N3).
+                // public IP (likely the same NAT/LAN, N1/N3). Loopback and
+                // private endpoints are only meaningful to peers on the
+                // same host/LAN — don't advertise them to remote peers
+                // (DEVLOG: home peer wasted handshakes on 127.0.0.1).
+                let requester_remote = remote_public(src);
                 let peers: Vec<(SocketAddr, u8)> = self
                     .peers
                     .keys()
                     .filter(|p| **p != src)
+                    .filter(|p| !(requester_remote && !remote_public(**p)))
                     .map(|p| {
                         let mut flags = 0u8;
                         if self.claims.get(p) == Some(p) {
@@ -942,5 +947,15 @@ fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
     match (a, b) {
         (SocketAddr::V4(x), SocketAddr::V4(y)) => x.ip() == y.ip(),
         _ => false,
+    }
+}
+
+/// Is `addr` a globally reachable endpoint (not loopback, not RFC1918)?
+/// Loopback/private peers of the master are meaningless to a remote peer;
+/// they must not be advertised (or handshaken) across the internet.
+pub fn remote_public(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_private(),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unicast_link_local(),
     }
 }
