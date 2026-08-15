@@ -601,13 +601,18 @@ impl Node {
         };
         let (store_count, local_newest) = self.store_segments();
         let edge = self.manifest_edge();
+        let public = self
+            .my_public
+            .map(|a| format!("\"{}\"", a))
+            .unwrap_or_else(|| "null".to_string());
         format!(
-            "{{\"version\":\"{}\",\"node\":\"{}\",\"role\":\"{}\",\"uptime_secs\":{},\"peers_in_swarm\":{},\"peers\":[{}],\"downloaded\":{{\"segments\":{},\"bytes\":{}}},\"uploaded\":{{\"segments\":{},\"bytes\":{}}},\"store_bytes\":{},\"store_segments\":{},\"edge_segment\":{},\"local_newest\":{},\"catch_up\":{},\"active_transfers\":{},\"queue_depth\":{},\"inflight\":{},{},\"rss_bytes\":{}}}",
+            "{{\"version\":\"{}\",\"node\":\"{}\",\"role\":\"{}\",\"uptime_secs\":{},\"peers_in_swarm\":{},\"public_endpoint\":{},\"peers\":[{}],\"downloaded\":{{\"segments\":{},\"bytes\":{}}},\"uploaded\":{{\"segments\":{},\"bytes\":{}}},\"store_bytes\":{},\"store_segments\":{},\"edge_segment\":{},\"local_newest\":{},\"catch_up\":{},\"active_transfers\":{},\"queue_depth\":{},\"inflight\":{},{},\"rss_bytes\":{}}}",
             env!("CARGO_PKG_VERSION"),
             json_escape(&self.name),
             self.role,
             uptime,
             self.peers.len(),
+            public,
             peers_json.join(","),
             self.downloaded_total,
             self.downloaded_bytes,

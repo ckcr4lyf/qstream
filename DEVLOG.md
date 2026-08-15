@@ -116,3 +116,32 @@ With those fixed, the whole §3 matrix passes in the lab:
   10.99.0.2:43358 — a port the master never saw.
 - 0 timeouts / 0 incomplete across all three homes; only trial NOT_FOUND
   churn. Handshakes complete, all paths fresh.
+
+## N4 verification — fake IGD (2025-08-15)
+
+`scripts/fake_igd.py`: an SSDP responder + device-description HTTP server +
+SOAP control endpoint (GetExternalIPAddress / AddPortMapping), logging
+every action. Verified end-to-end against `upnp::try_map`:
+
+- SSDP M-SEARCH → LOCATION → description → WANIPConnection controlURL
+  extraction → SOAP calls: all work, std-only.
+- A peer with the fake mapping logs `UPnP mapping claimed: <external>:<port>`
+  and sends it in handshakes.
+- Master verification: when claimed == observed (fake IGD pointed at
+  127.0.0.1), the peerlist entry carries `flags=0x03`
+  (UPNP_MAPPED | SAME_IP) — decoded live with a raw peerlist request.
+- The fake IGD is a reusable lab tool for CI.
+
+## Notes / limitations found
+
+- The LAN beacon only reaches peers bound to the SAME port on the same
+  broadcast domain (one qstream per host, same port across hosts — the
+  normal deployment). Same-host peers with different ports don't hear each
+  other's beacons; the master's peerlist covers discovery there.
+- home1's SNAT (kernel) is port-preserving; per-destination port
+  allocation (true symmetric NAT) is NOT emulated by iptables — the lab
+  proves cone-ish behavior. True symmetric x symmetric remains relay-only
+  (documented in NAT.md; relay intentionally not built).
+- The host's pre-existing MASQUERADE (VPS) was WAN-only and harmless, but
+  teaching the lab this lesson took a while: check for ambient NAT rules
+  before blaming your own setup.

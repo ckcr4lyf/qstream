@@ -1,6 +1,6 @@
 # qstream — NAT traversal plan (milestone N)
 
-Date: 2025-08-15 · Status: design, not yet implemented
+Date: 2025-08-15 · Status: N1-N4 implemented and lab-verified (see DEVLOG); N6 remains
 Scope: keep the swarm working when most peers are ordinary home clients
 behind NAT. At least the master is publicly reachable (VPS).
 
@@ -180,16 +180,16 @@ a later nicety).
 
 ## 6. Milestones
 
-| # | What | Test |
+| # | What | Status |
 |---|---|---|
-| N1 | Endpoint observation + handshake/peerlist v3 (public endpoint, flags); peers log their public endpoint | unit tests + lab: master reports correct endpoints |
-| N2 | PING/PONG: keep-alives, connectivity checks, punch bursts; sender pings first-time requesters; direct path works cone↔cone | `scripts/nat_sim.py` (§7) |
-| N3 | Relay: master relays for receivers; transfer-id routing; both-symmetric case works | nat_sim with symmetric NAT on both sides |
-| N4 | UPnP-IGD mapping (std-only SSDP/SOAP/mini-XML); promotion to tier 2 + relay-capable; graceful fallback | real router if available; else unit-test the XML/SOAP against captured samples |
-| N5 | Same-LAN shortcut (same_public_ip + private-port tries), optional LAN beacon | two netns sharing one "NAT" |
-| N6 | VPS live test: master on one VPS, peers on 2-3 others + a NATed client on a home LAN | real swarm over the internet |
+| N1 | Endpoint observation + handshake/peerlist v3 (public endpoint, flags) | ✅ lab-verified |
+| N2 | PING/PONG: keep-alives, connectivity checks, punch; direct path cone↔cone | ✅ lab-verified (cross-NAT transfers) |
+| N3 | Same-LAN: LAN beacon (broadcast PING) + private-address paths | ✅ lab-verified (home1↔home2 direct) |
+| N4 | UPnP-IGD mapping (std-only SSDP/SOAP/mini-XML), verified via fake IGD | ✅ lab-verified (flags=0x03) |
+| N5 | ~~same_public_ip private-port tries~~ → replaced by the LAN beacon | ✅ |
+| N6 | VPS live test: master on one VPS, peers on others + a NATed home client | ⏳ next |
 
-## 7. Testing without real routers: `scripts/nat_sim.py`
+## 7. Testing without real routers: `scripts/natlab.sh` (implemented)
 
 A small userspace NAT emulator is the lab tool: bind one UDP socket per
 "home", translate (private ip:port → nat ip:port) and enforce per-type
