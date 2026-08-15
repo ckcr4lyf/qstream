@@ -132,13 +132,90 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
     match fs::read(root.join(name)) {
         Ok(data) => {
             log::debug(&format!("http: GET /{name} -> 200 ({} bytes)", data.len()));
-            respond(&mut stream, 200, "OK", mime_of(name), &data, head_only);
+            // Serve a playlist filtered to segments that actually exist, so
+            // players never 404 on a live edge the node hasn't replicated
+            // yet (DEVLOG: remote peer lag -> mpv 404 storm).
+            let body = if name.ends_with(".m3u8") {
+                filter_playlist(&root, &data)
+            } else {
+                data
+            };
+            respond(&mut stream, 200, "OK", mime_of(name), &body, head_only);
         }
         Err(_) => {
             log::debug(&format!("http: GET /{name} -> 404"));
             respond(&mut stream, 404, "Not Found", "text/plain", b"not found\n", head_only);
         }
     }
+}
+
+/// Rewrite an m3u8 playlist to list only segments present in `root`.
+/// EXT-X-MEDIA-SEQUENCE is advanced to the first kept segment so the
+/// playlist stays coherent; the master (which has everything) is unchanged.
+fn filter_playlist(root: &std::path::Path, data: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(data);
+    let mut seq: u64 = 0;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            seq = rest.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut pending: Vec<&str> = Vec::new(); // # lines queued before a segment
+    let mut first_kept: Option<u64> = None;
+    let mut saw_m3u = false;
+    for line in text.lines() {
+        if line.starts_with('#') {
+            if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
+                continue; // re-emitted after we know the first kept segment
+            }
+            pending.push(line);
+            if line.starts_with("#EXTM3U") {
+                saw_m3u = true;
+            }
+            continue;
+        }
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if root.join(name).is_file() {
+            if first_kept.is_none() {
+                first_kept = Some(seq);
+            }
+            for p in pending.drain(..) {
+                out.extend_from_slice(p.as_bytes());
+                out.push(b'\n');
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.push(b'\n');
+        } else {
+            pending.clear(); // drop EXTINF etc. for missing segments
+        }
+        seq += 1;
+    }
+    // Empty result (nothing available yet): serve the original so players
+    // at least see the edge and retry.
+    if !saw_m3u || out.is_empty() {
+        return data.to_vec();
+    }
+    // Insert the advanced MEDIA-SEQUENCE right after #EXTM3U/#EXT-X-VERSION.
+    let insert = format!("#EXT-X-MEDIA-SEQUENCE:{}\n", first_kept.unwrap_or(0));
+    let mut final_out: Vec<u8> = Vec::with_capacity(out.len() + 32);
+    let text_out = String::from_utf8_lossy(&out);
+    let mut inserted = false;
+    for line in text_out.lines() {
+        final_out.extend_from_slice(line.as_bytes());
+        final_out.push(b'\n');
+        if !inserted && (line.starts_with("#EXTM3U") || line.starts_with("#EXT-X-VERSION:")) {
+            final_out.extend_from_slice(insert.as_bytes());
+            inserted = true;
+        }
+    }
+    if !inserted {
+        final_out.extend_from_slice(insert.as_bytes());
+    }
+    final_out
 }
 
 fn mime_of(name: &str) -> &'static str {
@@ -174,4 +251,73 @@ fn respond(
         let _ = stream.write_all(body);
     }
     let _ = stream.flush();
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qstream_http_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn playlist_filter_keeps_only_present_segments() {
+        let dir = tmpdir("filter1");
+        fs::write(dir.join("seg_0100.ts"), b"x").unwrap();
+        fs::write(dir.join("seg_0102.ts"), b"x").unwrap();
+        let playlist = "\
+#EXTM3U\n\
+#EXT-X-VERSION:3\n\
+#EXT-X-TARGETDURATION:2\n\
+#EXT-X-MEDIA-SEQUENCE:100\n\
+#EXTINF:2.0,\n\
+seg_0100.ts\n\
+#EXTINF:2.0,\n\
+seg_0101.ts\n\
+#EXTINF:2.0,\n\
+seg_0102.ts\n";
+        let out = filter_playlist(&dir, playlist.as_bytes());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("seg_0100.ts"));
+        assert!(!text.contains("seg_0101.ts"));
+        assert!(text.contains("seg_0102.ts"));
+        // MEDIA-SEQUENCE must stay 100 (first kept is the first segment).
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:100"));
+        // EXTINF for the dropped segment must not linger.
+        assert_eq!(text.matches("#EXTINF").count(), 2);
+    }
+
+    #[test]
+    fn playlist_filter_advances_sequence_after_dropped_leader() {
+        let dir = tmpdir("filter2");
+        fs::write(dir.join("seg_0102.ts"), b"x").unwrap();
+        let playlist = "\
+#EXTM3U\n\
+#EXT-X-MEDIA-SEQUENCE:100\n\
+#EXTINF:2.0,\n\
+seg_0100.ts\n\
+#EXTINF:2.0,\n\
+seg_0101.ts\n\
+#EXTINF:2.0,\n\
+seg_0102.ts\n";
+        let out = filter_playlist(&dir, playlist.as_bytes());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:102"));
+        assert!(text.contains("seg_0102.ts"));
+        assert!(!text.contains("seg_0100.ts"));
+    }
+
+    #[test]
+    fn playlist_filter_empty_falls_back_to_original() {
+        let dir = tmpdir("filter3");
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:2.0,\nseg_0005.ts\n";
+        assert_eq!(
+            filter_playlist(&dir, playlist.as_bytes()),
+            playlist.as_bytes()
+        );
+    }
 }

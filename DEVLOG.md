@@ -166,3 +166,33 @@ filtering).
 the loopback peers initiated handshakes toward it (via its UPnP endpoint),
 and it registered them at the host's PUBLIC IP:port (45.87.251.232:4448),
 which is locally delivered — so cross-topology transfers worked anyway.
+
+## Remote peer playback: 404 storm + catch-up lag (2025-08-15) — FIXED
+
+**Symptom (home peer):** mpv fetched the playlist and immediately requested
+the NEWEST segments, which the peer hadn't downloaded yet -> 404 per
+segment; the peer itself was ~19 segments behind the live edge.
+
+**Root causes:**
+1. `sync_queue` enqueued playlist segments OLDEST first — the peer raced
+   toward the edge only after fetching history, and it never quite got
+   there because...
+2. Segment transfers are RTT-bound: the receiver-driven windows take
+   ~log2(packets) round trips (~7 for a 250-packet segment), and at the
+   home peer's ~200-500ms RTT that's ~1.6s per segment — barely above the
+   stream rate, so the gap never closed. (Pipelined windows are the real
+   fix; backlog.)
+3. The peer's HTTP served the manifest unfiltered — segments listed but
+   not yet on disk -> player 404s.
+
+**Fixes:**
+- `http.rs`: serve playlists filtered to segments that exist on disk,
+  EXT-X-MEDIA-SEQUENCE advanced to the first kept segment (3 unit tests).
+  Players can never request a missing segment; they track the available
+  tail instead. Master unaffected (has everything).
+- `peer.rs`: `sync_queue` now enqueues NEWEST first — the peer races to
+  the edge; old segments (which roll off anyway) are fetched opportunistically.
+
+**Also observed:** the home peer's peerlist showed `192.168.128.1:4447` —
+a LAN-beacon discovery of another qstream instance on the user's home
+network; benign (trial NOT_FOUND churn).

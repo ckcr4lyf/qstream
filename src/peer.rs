@@ -524,6 +524,9 @@ fn sync_queue(
             continue;
         }
         queued.insert(filename.clone());
-        queue.push_back(filename);
+        // Newest first: live players want the edge, and older playlist
+        // segments roll off anyway (DEVLOG: oldest-first left the peer far
+        // behind the edge, 404 storm for the player).
+        queue.push_front(filename);
     }
 }
