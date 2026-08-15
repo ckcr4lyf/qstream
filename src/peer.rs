@@ -66,10 +66,7 @@ pub fn run(
         data_dir.display()
     ));
 
-    let stats_sink: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot {
-        lines: Vec::new(),
-        json: String::new(),
-    }));
+    let stats_sink: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot::default()));
     if let Some(hp) = http_port {
         let root = data_dir.clone();
         let stats = stats_sink.clone();

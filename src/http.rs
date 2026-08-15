@@ -100,6 +100,25 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
             return;
         }
     }
+    if name == "metrics" {
+        if let Some(stats) = stats {
+            let body = stats.lock().map(|g| g.metrics.clone()).unwrap_or_default();
+            let body = if body.is_empty() {
+                String::new()
+            } else {
+                format!("{body}\n")
+            };
+            respond(
+                &mut stream,
+                200,
+                "OK",
+                "text/plain; version=0.0.4",
+                body.as_bytes(),
+                head_only,
+            );
+            return;
+        }
+    }
     if name == "health" {
         respond(&mut stream, 200, "OK", "text/plain", b"ok\n", head_only);
         return;

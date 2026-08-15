@@ -90,10 +90,13 @@ impl PeerStat {
     }
 }
 
-/// Shared stats snapshot served at /peers (text) and /stats (JSON).
+/// Shared stats snapshot served at /peers (text), /stats (JSON) and
+/// /metrics (Prometheus exposition).
+#[derive(Default)]
 pub struct StatsSnapshot {
     pub lines: Vec<String>,
     pub json: String,
+    pub metrics: String,
 }
 
 pub struct Node {
@@ -345,6 +348,7 @@ impl Node {
             if let Ok(mut guard) = sink.lock() {
                 guard.lines = self.stats_lines(now);
                 guard.json = self.stats_json(now);
+                guard.metrics = self.metrics_text(now);
             }
         }
     }
@@ -488,6 +492,86 @@ impl Node {
             fault_json,
             Self::rss_bytes()
         )
+    }
+
+    /// Prometheus text exposition for GET /metrics (M5). Flat series with
+    /// a `node` label; per-peer series carry a `peer` label.
+    fn metrics_text(&self, now: Instant) -> String {
+        const DEFS: &[(&str, &str, &str)] = &[
+            ("qstream_uptime_seconds", "Seconds since node start.", "gauge"),
+            ("qstream_peers_in_swarm", "Number of peers currently known to this node.", "gauge"),
+            ("qstream_downloaded_segments_total", "Segments fully downloaded by this node.", "counter"),
+            ("qstream_downloaded_bytes_total", "Bytes fully downloaded by this node.", "counter"),
+            ("qstream_uploaded_segments_total", "Segments served to other nodes.", "counter"),
+            ("qstream_uploaded_bytes_total", "Bytes served to other nodes.", "counter"),
+            ("qstream_store_segments", "Segments currently in the local store.", "gauge"),
+            ("qstream_store_bytes", "Bytes currently in the local store.", "gauge"),
+            ("qstream_edge_segment", "Newest segment number in the synced manifest.", "gauge"),
+            ("qstream_local_newest", "Newest segment number in the local store.", "gauge"),
+            ("qstream_catch_up", "Segments behind the live edge (0 = caught up).", "gauge"),
+            ("qstream_active_transfers", "In-flight senders + receivers.", "gauge"),
+            ("qstream_queue_depth", "Pending segment pulls in the queue.", "gauge"),
+            ("qstream_inflight", "Active pull jobs.", "gauge"),
+            ("qstream_rss_bytes", "Resident memory of this process.", "gauge"),
+            ("qstream_fault_dropped_total", "Datagrams dropped by fault injection.", "counter"),
+            ("qstream_fault_emitted_total", "Datagrams emitted by fault injection.", "counter"),
+            ("qstream_peer_score", "Quality score 0-100 for a known peer.", "gauge"),
+            ("qstream_peer_pulls_total", "Successful pulls from a peer.", "counter"),
+            ("qstream_peer_nf_pulls_total", "NOT_FOUND responses from a peer.", "counter"),
+            ("qstream_peer_timeouts_total", "No-response failures from a peer.", "counter"),
+            ("qstream_peer_served_total", "Segments served to a peer.", "counter"),
+            ("qstream_peer_latency_ms", "EWMA first-packet latency to a peer.", "gauge"),
+        ];
+
+        let mut out = String::with_capacity(4096);
+        for (name, help, ty) in DEFS {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {ty}\n"));
+        }
+        let mut s = |name: &str, labels: &str, value: u64| {
+            out.push_str(&format!("{name}{labels} {value}\n"));
+        };
+
+        let nl = format!("{{node=\"{}\"}}", json_escape(&self.name));
+        let uptime = now.duration_since(self.started).as_secs();
+        let (store_count, local_newest) = self.store_segments();
+        let edge = self.manifest_edge();
+
+        s("qstream_uptime_seconds", &nl, uptime);
+        s("qstream_peers_in_swarm", &nl, self.peers.len() as u64);
+        s("qstream_downloaded_segments_total", &nl, self.downloaded_total);
+        s("qstream_downloaded_bytes_total", &nl, self.downloaded_bytes);
+        s("qstream_uploaded_segments_total", &nl, self.served_total);
+        s("qstream_uploaded_bytes_total", &nl, self.served_bytes);
+        s("qstream_store_segments", &nl, store_count);
+        s("qstream_store_bytes", &nl, self.store_bytes());
+        s("qstream_edge_segment", &nl, edge);
+        s("qstream_local_newest", &nl, local_newest);
+        s("qstream_catch_up", &nl, edge.saturating_sub(local_newest));
+        s("qstream_active_transfers", &nl, self.registry.active_count() as u64);
+        s("qstream_queue_depth", &nl, self.queue_depth);
+        s("qstream_inflight", &nl, self.inflight);
+        s("qstream_rss_bytes", &nl, Self::rss_bytes());
+        if self.fault.enabled() {
+            s("qstream_fault_dropped_total", &nl, self.fault.stats.dropped);
+            s("qstream_fault_emitted_total", &nl, self.fault.stats.emitted);
+        }
+
+        let mut ranked: Vec<(&SocketAddr, &PeerStat)> = self.peer_stats.iter().collect();
+        ranked.sort_by(|a, b| b.1.score.cmp(&a.1.score).then(a.0.cmp(b.0)));
+        for (_, stat) in ranked {
+            let pl = format!(
+                "{{node=\"{}\",peer=\"{}\"}}",
+                json_escape(&self.name),
+                json_escape(&stat.name)
+            );
+            s("qstream_peer_score", &pl, stat.score as u64);
+            s("qstream_peer_pulls_total", &pl, stat.pulls as u64);
+            s("qstream_peer_nf_pulls_total", &pl, stat.nf_pulls as u64);
+            s("qstream_peer_timeouts_total", &pl, stat.timeouts as u64);
+            s("qstream_peer_served_total", &pl, stat.served as u64);
+            s("qstream_peer_latency_ms", &pl, stat.latency_ms as u64);
+        }
+        out
     }
 
     fn log_ranking(&mut self, now: Instant) {

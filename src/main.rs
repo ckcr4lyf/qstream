@@ -25,7 +25,7 @@ EXAMPLES:
     qstream peer 4444 127.0.0.1 3333 ./data 8081
 
 Play the stream: ffplay http://127.0.0.1:8080/live.m3u8 -live_start_index 0
-Stats:        curl http://127.0.0.1:8080/stats   (JSON) | /peers (ranking text) | /health
+Stats:        curl http://127.0.0.1:8080/stats   (JSON) | /peers (ranking) | /metrics (Prometheus)
 
 Env:
     QSTREAM_NAME            node name sent in handshake (default \"master\" / \"peer\")

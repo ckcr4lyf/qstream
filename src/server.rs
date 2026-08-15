@@ -40,10 +40,7 @@ pub fn run(
 
     if let Some(hp) = http_port {
         let root = segment_root.clone();
-        let stats: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot {
-            lines: Vec::new(),
-            json: String::new(),
-        }));
+        let stats: Arc<Mutex<StatsSnapshot>> = Arc::new(Mutex::new(StatsSnapshot::default()));
         let stats_http = stats.clone();
         thread::spawn(move || {
             if let Err(e) = http::serve(root, hp, Some(stats_http)) {
