@@ -11,8 +11,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::fault::FaultInjector;
 use crate::log;
-use crate::protocol::{self, Message};
+use crate::protocol::{self, Message, PEER_SAME_IP, PEER_UPNP_MAPPED};
 use crate::transfer::{self, RegEvent, TransferRegistry};
+
+/// PING every peer on this cadence (N2): each PING is a keep-alive that
+/// keeps both NATs' mappings alive and doubles as a punch (simultaneous
+/// open happens naturally when both sides ping).
+pub const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// LAN beacon cadence (N3): a broadcast PING announces the node on the LAN.
+pub const BEACON_INTERVAL: Duration = Duration::from_secs(5);
+/// A path counts as fresh while a PONG was received within this window.
+pub const PATH_FRESH: Duration = Duration::from_secs(30);
 
 /// Events a caller (the peer) may want to react to.
 #[derive(Debug)]
@@ -21,8 +30,8 @@ pub enum Event {
     HandshakeResponse { src: SocketAddr, name: String },
     /// A MANIFEST_RESPONSE arrived with the raw m3u8 bytes.
     ManifestResponse { data: Vec<u8> },
-    /// A PEERLIST_RESPONSE arrived with discovered peers.
-    PeerlistResponse { peers: Vec<SocketAddr> },
+    /// A PEERLIST_RESPONSE arrived with discovered peers (addr + flags).
+    PeerlistResponse { peers: Vec<(SocketAddr, u8)> },
     /// Nothing the caller needs to act on.
     None,
 }
@@ -99,6 +108,23 @@ pub struct StatsSnapshot {
     pub metrics: String,
 }
 
+/// Reachability state for one peer address (N2): when did we last ping it
+/// and get a PONG, and was the path discovered on the LAN (beacon)?
+#[derive(Debug, Clone)]
+pub struct PathState {
+    pub last_ping: Instant,
+    pub last_pong: Option<Instant>,
+    pub lan: bool,
+}
+
+impl PathState {
+    fn fresh(&self, now: Instant) -> bool {
+        self.last_pong
+            .map(|t| now.duration_since(t) < PATH_FRESH)
+            .unwrap_or(false)
+    }
+}
+
 pub struct Node {
     pub socket: UdpSocket,
     pub name: String,
@@ -111,6 +137,17 @@ pub struct Node {
     pub peer_stats: HashMap<SocketAddr, PeerStat>,
     /// Outgoing-datagram fault injection (M5).
     pub fault: FaultInjector,
+    /// Our observed public endpoint (from handshake responses, N1).
+    pub my_public: Option<SocketAddr>,
+    /// Our claimed public endpoint (UPnP mapping, N4), if any.
+    pub claimed: Option<SocketAddr>,
+    /// Claimed endpoints reported by peers (N1): peer addr -> claimed.
+    claims: HashMap<SocketAddr, SocketAddr>,
+    /// Ping/pong reachability per peer address (N2).
+    paths: HashMap<SocketAddr, PathState>,
+    local_addr: SocketAddr,
+    next_ping: Instant,
+    next_beacon: Instant,
     started: Instant,
     downloaded_total: u64,
     downloaded_bytes: u64,
@@ -143,6 +180,7 @@ impl Node {
         if fault.enabled() {
             log::info(&fault.summary());
         }
+        let local_addr = socket.local_addr().unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
         Node {
             socket,
             name,
@@ -152,6 +190,13 @@ impl Node {
             peers: HashMap::new(),
             peer_stats: HashMap::new(),
             fault,
+            my_public: None,
+            claimed: None,
+            claims: HashMap::new(),
+            paths: HashMap::new(),
+            local_addr,
+            next_ping: Instant::now() + PING_INTERVAL,
+            next_beacon: Instant::now() + BEACON_INTERVAL,
             started: Instant::now(),
             downloaded_total: 0,
             downloaded_bytes: 0,
@@ -165,6 +210,50 @@ impl Node {
             next_prune: Instant::now() + Duration::from_secs(30),
             stats_sink,
         }
+    }
+
+    /// Set our claimed public endpoint (UPnP mapping, N4).
+    pub fn set_claimed(&mut self, addr: SocketAddr) {
+        self.claimed = Some(addr);
+        log::info(&format!("UPnP mapping claimed: {addr}"));
+    }
+
+    pub fn path_state(&self, addr: SocketAddr) -> Option<&PathState> {
+        self.paths.get(&addr)
+    }
+
+    /// Is the direct path to `addr` fresh (PONG within PATH_FRESH)?
+    pub fn path_fresh(&self, addr: SocketAddr, now: Instant) -> bool {
+        self.paths.get(&addr).map(|p| p.fresh(now)).unwrap_or(false)
+    }
+
+    /// Resolve a peer address to the best address to reach it: if the same
+    /// peer name is known via a LAN path, use that (N3, connectivity
+    /// ladder tier 1).
+    pub fn effective_addr(&self, addr: SocketAddr) -> SocketAddr {
+        let name = self.peers.get(&addr).map(|p| p.name.clone());
+        if let Some(name) = name {
+            for (a, info) in &self.peers {
+                if info.name == name
+                    && a != &addr
+                    && self.paths.get(a).map(|p| p.lan).unwrap_or(false)
+                {
+                    return *a;
+                }
+            }
+        }
+        addr
+    }
+
+    /// Record a PONG for `src` (fresh direct path).
+    fn record_pong(&mut self, src: SocketAddr, now: Instant) {
+        let entry = self.paths.entry(src).or_insert(PathState {
+            last_ping: now,
+            last_pong: None,
+            lan: false,
+        });
+        entry.last_pong = Some(now);
+        entry.last_ping = now;
     }
 
     /// Send one datagram through the fault injector.
@@ -186,6 +275,11 @@ impl Node {
         self.peer_stats
             .entry(addr)
             .or_insert_with(|| PeerStat::new(name));
+        self.paths.entry(addr).or_insert(PathState {
+            last_ping: Instant::now(),
+            last_pong: None,
+            lan: false,
+        });
     }
 
     fn touch_peer(&mut self, addr: SocketAddr) {
@@ -295,9 +389,37 @@ impl Node {
             }
         }
 
+        self.ping_cycle(now);
         self.prune_segments(now);
         self.publish_snapshot(now);
         self.log_ranking(now);
+    }
+
+    /// PING every known peer (keep-alive + punch, N2) and, for peers, a
+    /// LAN beacon (broadcast PING, N3).
+    fn ping_cycle(&mut self, now: Instant) {
+        if now >= self.next_ping {
+            self.next_ping = now + PING_INTERVAL;
+            let ping = Message::Ping {
+                name: self.name.clone(),
+            };
+            for addr in self.peers.keys().copied().collect::<Vec<_>>() {
+                self.send(&protocol::encode(&ping), addr);
+                self.paths.entry(addr).or_insert(PathState {
+                    last_ping: now,
+                    last_pong: None,
+                    lan: false,
+                });
+            }
+        }
+        if self.role == "peer" && now >= self.next_beacon {
+            self.next_beacon = now + BEACON_INTERVAL;
+            let ping = Message::Ping {
+                name: self.name.clone(),
+            };
+            let broadcast = SocketAddr::from(([255, 255, 255, 255], self.local_addr.port()));
+            self.send(&protocol::encode(&ping), broadcast);
+        }
     }
 
     /// Delete segments that rolled out of the playlist and are older than
@@ -612,18 +734,50 @@ impl Node {
         self.touch_peer(src);
 
         match message {
-            Message::HandshakeRequest { name } => {
+            Message::HandshakeRequest { claimed, name } => {
                 log::info(&format!("handshake from {src} (name: {name})"));
-                self.register_peer(src, name);
+                self.register_peer(src, name.clone());
+                self.claims.insert(src, claimed);
                 let reply = Message::HandshakeResponse {
+                    observed: src,
                     name: self.name.clone(),
                 };
                 self.send(&protocol::encode(&reply), src);
                 Event::None
             }
-            Message::HandshakeResponse { name } => {
+            Message::HandshakeResponse { observed, name } => {
                 log::debug(&format!("handshake response from {src} (name: {name})"));
+                if self.my_public != Some(observed) {
+                    log::info(&format!("my public endpoint (as seen by {src}): {observed}"));
+                }
+                self.my_public = Some(observed);
                 Event::HandshakeResponse { src, name }
+            }
+            Message::Ping { name } => {
+                if src == self.local_addr {
+                    return Event::None; // our own broadcast beacon
+                }
+                let known = self.peers.contains_key(&src);
+                if !known {
+                    // First contact via PING: a LAN beacon or a punch probe.
+                    // Register it — the address we saw is the one to use.
+                    let display = if name.is_empty() {
+                        src.to_string()
+                    } else {
+                        name.clone()
+                    };
+                    log::info(&format!("discovered peer {display} at {src} (ping)"));
+                    self.register_peer(src, display);
+                    self.paths.get_mut(&src).map(|p| p.lan = true);
+                }
+                let pong = Message::Pong;
+                self.send(&protocol::encode(&pong), src);
+                Event::None
+            }
+            Message::Pong => {
+                log::trace(&format!("pong from {src} — direct path fresh"));
+                self.record_pong(src, Instant::now());
+                Event::None
             }
             Message::ManifestRequest => {
                 // Re-read from disk every time — the live playlist rolls.
@@ -637,12 +791,24 @@ impl Node {
                 Event::ManifestResponse { data }
             }
             Message::PeerlistRequest => {
-                // Reply with our view, excluding the requester.
-                let peers: Vec<SocketAddr> = self
+                // Reply with our view, excluding the requester. Each entry
+                // carries flags: UPNP_MAPPED if the peer's claimed mapping
+                // is what we observe, SAME_IP if it shares the requester's
+                // public IP (likely the same NAT/LAN, N1/N3).
+                let peers: Vec<(SocketAddr, u8)> = self
                     .peers
                     .keys()
                     .filter(|p| **p != src)
-                    .cloned()
+                    .map(|p| {
+                        let mut flags = 0u8;
+                        if self.claims.get(p) == Some(p) {
+                            flags |= PEER_UPNP_MAPPED;
+                        }
+                        if same_ip4(*p, src) {
+                            flags |= PEER_SAME_IP;
+                        }
+                        (*p, flags)
+                    })
                     .collect();
                 let n = peers.len();
                 let reply = Message::PeerlistResponse { peers };
@@ -722,5 +888,13 @@ mod tests {
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
         assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+}
+
+/// Do two addresses share an IPv4 address? (Peerlist SAME_IP flag, N1.)
+fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
+    match (a, b) {
+        (SocketAddr::V4(x), SocketAddr::V4(y)) => x.ip() == y.ip(),
+        _ => false,
     }
 }

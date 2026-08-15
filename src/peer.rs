@@ -20,8 +20,9 @@ use crate::fault::Rng;
 use crate::http;
 use crate::log;
 use crate::node::{Event, Node, PullResult, StatsSnapshot};
-use crate::protocol::{self, Message};
+use crate::protocol::{self, Message, PEER_SAME_IP};
 use crate::transfer;
+use crate::upnp;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Manifest poll base interval; each poll is staggered by 0..JITTER so
@@ -60,6 +61,7 @@ pub fn run(
     fs::create_dir_all(&data_dir)?;
 
     let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
+    let _ = socket.set_broadcast(true); // LAN beacon (N3)
     let local_addr = socket.local_addr()?;
     log::info(&format!(
         "peer listening on 0.0.0.0:{local_port} (name: {name}, data dir: {})",
@@ -88,6 +90,15 @@ pub fn run(
         Some(stats_sink),
     );
 
+    // Opportunistic UPnP mapping (N4): promotes us to directly-reachable.
+    // Disable with QSTREAM_NO_UPNP=1 (fault/lab tests).
+    if std::env::var("QSTREAM_NO_UPNP").is_err() {
+        match upnp::try_map(local_port) {
+            Some(addr) => node.set_claimed(addr),
+            None => log::info("UPnP mapping unavailable — continuing without one"),
+        }
+    }
+
     // --- protocol state ---
     let mut handshake_done = false;
     let mut next_handshake_retry = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -111,6 +122,7 @@ pub fn run(
 
     // Initial handshake with the bootstrap node.
     let hs = Message::HandshakeRequest {
+        claimed: node.claimed.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
         name: name.to_string(),
     };
     node.send(&protocol::encode(&hs), remote);
@@ -176,8 +188,15 @@ pub fn run(
                         poll_timeout = None;
                     }
                     Event::PeerlistResponse { peers } => {
-                        for peer in peers {
+                        for (peer, flags) in peers {
                             if peer == local_addr || peer.port() == 0 {
+                                continue;
+                            }
+                            // Same public IP as us: same NAT/LAN — the LAN
+                            // beacon (broadcast PING) will find it directly;
+                            // handshaking the public endpoint would hit the
+                            // NAT's hairpin behavior (N3).
+                            if flags & PEER_SAME_IP != 0 {
                                 continue;
                             }
                             if node.peers.contains_key(&peer)
@@ -187,6 +206,9 @@ pub fn run(
                             }
                             pending_handshakes.insert(peer, now + HANDSHAKE_TIMEOUT);
                             let req = Message::HandshakeRequest {
+                                claimed: node
+                                    .claimed
+                                    .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
                                 name: name.to_string(),
                             };
                             node.send(&protocol::encode(&req), peer);
@@ -212,6 +234,7 @@ pub fn run(
         // polling is not gated on it — the bootstrap answers anyway.
         if !handshake_done && now >= next_handshake_retry {
             let req = Message::HandshakeRequest {
+                claimed: node.claimed.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
                 name: name.to_string(),
             };
             node.send(&protocol::encode(&req), remote);
@@ -411,13 +434,16 @@ fn pick_peer(
 ) -> Option<SocketAddr> {
     let tried_for = tried.get(filename);
     let inflight = |p: &SocketAddr| active.values().filter(|j| &j.peer == p).count();
+    // Candidates are resolved to their best reachable address (LAN path
+    // preferred, N3) and weighted by path freshness (N2).
+    let now = Instant::now();
     let candidates: Vec<SocketAddr> = node
         .peers
         .keys()
-        .filter(|p| **p != local_addr)
+        .map(|p| node.effective_addr(*p))
+        .filter(|p| *p != local_addr)
         .filter(|p| tried_for.map(|s| !s.contains(p)).unwrap_or(true))
         .filter(|p| inflight(p) < MAX_INFLIGHT_PER_PEER)
-        .cloned()
         .collect();
     if candidates.is_empty() {
         return None;
@@ -425,7 +451,8 @@ fn pick_peer(
     let weight = |p: &SocketAddr| -> f64 {
         let inflight = inflight(p) as f64;
         let score = node.peer_stats.get(p).map(|s| s.score as f64).unwrap_or(50.0);
-        let mut w = (score + 1.0) / (inflight + 1.0);
+        let fresh = if node.path_fresh(*p, now) { 1.25 } else { 0.7 };
+        let mut w = (score + 1.0) / (inflight + 1.0) * fresh;
         if *p == bootstrap {
             w *= 0.85; // slight bias toward peers sharing the load
         }

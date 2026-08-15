@@ -7,8 +7,12 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub const MAGIC: [u8; 3] = *b"QST";
-pub const PROTOCOL_VERSION: u8 = 0x02;
+pub const PROTOCOL_VERSION: u8 = 0x03;
 pub const HEADER_SIZE: usize = 14;
+
+/// Peerlist entry flags (N1):
+pub const PEER_UPNP_MAPPED: u8 = 0x01; // claimed endpoint == observed (verified mapping)
+pub const PEER_SAME_IP: u8 = 0x02;     // same public IP as the requester (likely same NAT)
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,11 +23,13 @@ pub enum MessageType {
     ManifestResponse = 0x21,
     SegmentRequest = 0x30,
     SegmentContents = 0x31,
-            SegmentNotFound = 0x32,
-            Ack = 0x40,
-            PeerlistRequest = 0x50,
-            PeerlistResponse = 0x51,
-        }
+    SegmentNotFound = 0x32,
+    Ack = 0x40,
+    PeerlistRequest = 0x50,
+    PeerlistResponse = 0x51,
+    Ping = 0x60,
+    Pong = 0x61,
+}
 
 impl MessageType {
     pub fn from_u8(code: u8) -> Option<MessageType> {
@@ -38,6 +44,8 @@ impl MessageType {
             0x40 => Some(Self::Ack),
             0x50 => Some(Self::PeerlistRequest),
             0x51 => Some(Self::PeerlistResponse),
+            0x60 => Some(Self::Ping),
+            0x61 => Some(Self::Pong),
             _ => None,
         }
     }
@@ -67,10 +75,14 @@ impl AckType {
 /// A decoded message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// HANDSHAKE_REQUEST — payload: node name (UTF-8).
-    HandshakeRequest { name: String },
-    /// HANDSHAKE_RESPONSE — payload: node name (UTF-8).
-    HandshakeResponse { name: String },
+    /// HANDSHAKE_REQUEST — payload: claimed endpoint (6 B) + name (UTF-8).
+    /// The claimed endpoint is a UPnP/NAT-PMP mapping, if any (0.0.0.0:0 if
+    /// none).
+    HandshakeRequest { claimed: SocketAddr, name: String },
+    /// HANDSHAKE_RESPONSE — payload: observed endpoint (6 B) + name (UTF-8).
+    /// The observed endpoint is the requester's public endpoint as seen by
+    /// the responder (in-band STUN).
+    HandshakeResponse { observed: SocketAddr, name: String },
     /// MANIFEST_REQUEST — no payload.
     ManifestRequest,
     /// MANIFEST_RESPONSE — payload: raw manifest (m3u8) bytes.
@@ -96,8 +108,13 @@ pub enum Message {
     },
     /// PEERLIST_REQUEST — no payload.
     PeerlistRequest,
-    /// PEERLIST_RESPONSE — payload: packed (ip:port) entries, 6 bytes each.
-    PeerlistResponse { peers: Vec<SocketAddr> },
+    /// PEERLIST_RESPONSE — payload: packed (ip:port) entries + flags byte.
+    PeerlistResponse { peers: Vec<(SocketAddr, u8)> },
+    /// PING — payload: node name (UTF-8, may be empty). Doubles as LAN
+    /// beacon when broadcast; a PONG proves the direct path works (N2).
+    Ping { name: String },
+    /// PONG — no payload.
+    Pong,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +135,7 @@ pub enum ProtocolError {
     BadAckFlags { got: u8 },
     /// Progress ACK payload must be exactly 4 bytes.
     BadAckPayload { len: usize },
-    /// Peerlist payload length must be a multiple of 6 bytes.
+    /// Peerlist payload length must be a multiple of 7 bytes.
     BadPeerlistPayload { len: usize },
 }
 
@@ -148,7 +165,7 @@ impl fmt::Display for ProtocolError {
                 write!(f, "progress ACK payload must be 4 bytes, got {len}")
             }
             ProtocolError::BadPeerlistPayload { len } => {
-                write!(f, "peerlist payload must be a multiple of 6 bytes, got {len}")
+                write!(f, "peerlist payload must be a multiple of 7 bytes, got {len}")
             }
         }
     }
@@ -189,11 +206,20 @@ pub fn encode(message: &Message) -> Vec<u8> {
             } => (MessageType::Ack, *ack_type as u8, *transfer_id, 0, 0),
             Message::PeerlistRequest => (MessageType::PeerlistRequest, 0, 0, 0, 0),
             Message::PeerlistResponse { .. } => (MessageType::PeerlistResponse, 0, 0, 0, 0),
+            Message::Ping { .. } => (MessageType::Ping, 0, 0, 0, 0),
+            Message::Pong => (MessageType::Pong, 0, 0, 0, 0),
         };
 
     let payload: Vec<u8> = match message {
-        Message::HandshakeRequest { name } | Message::HandshakeResponse { name } => {
-            name.as_bytes().to_vec()
+        Message::HandshakeRequest { claimed, name } => {
+            let mut p = endpoint_bytes(*claimed);
+            p.extend_from_slice(name.as_bytes());
+            p
+        }
+        Message::HandshakeResponse { observed, name } => {
+            let mut p = endpoint_bytes(*observed);
+            p.extend_from_slice(name.as_bytes());
+            p
         }
         Message::ManifestRequest => Vec::new(),
         Message::ManifestResponse { data } => data.clone(),
@@ -217,6 +243,8 @@ pub fn encode(message: &Message) -> Vec<u8> {
         }
         Message::PeerlistRequest => Vec::new(),
         Message::PeerlistResponse { peers } => encode_peers(peers),
+        Message::Ping { name } => name.as_bytes().to_vec(),
+        Message::Pong => Vec::new(),
     };
 
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
@@ -266,12 +294,14 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
     let payload = &payload[..data_length];
 
     Ok(match message_type {
-        MessageType::HandshakeRequest => Message::HandshakeRequest {
-            name: utf8_name(payload)?,
-        },
-        MessageType::HandshakeResponse => Message::HandshakeResponse {
-            name: utf8_name(payload)?,
-        },
+        MessageType::HandshakeRequest => {
+            let (claimed, name) = split_endpoint_name(payload)?;
+            Message::HandshakeRequest { claimed, name }
+        }
+        MessageType::HandshakeResponse => {
+            let (observed, name) = split_endpoint_name(payload)?;
+            Message::HandshakeResponse { observed, name }
+        }
         MessageType::ManifestRequest => Message::ManifestRequest,
         MessageType::ManifestResponse => Message::ManifestResponse {
             data: payload.to_vec(),
@@ -313,32 +343,66 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::PeerlistResponse => Message::PeerlistResponse {
             peers: decode_peers(payload)?,
         },
+        MessageType::Ping => Message::Ping {
+            name: utf8_name(payload)?,
+        },
+        MessageType::Pong => Message::Pong,
     })
 }
 
-/// Pack peer addresses: 4-byte IPv4 octets + 2-byte big-endian port, per entry.
-fn encode_peers(peers: &[SocketAddr]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(peers.len() * 6);
-    for peer in peers {
+/// Encode a SocketAddr as 6 bytes (ipv4 octets + big-endian port);
+/// non-IPv4 or port 0 becomes all zeros.
+fn endpoint_bytes(addr: SocketAddr) -> Vec<u8> {
+    let mut p = Vec::with_capacity(6);
+    match addr {
+        SocketAddr::V4(v4) if v4.port() != 0 => {
+            p.extend_from_slice(&v4.ip().octets());
+            p.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        _ => p.extend_from_slice(&[0u8; 6]),
+    }
+    p
+}
+
+/// Split a 6-byte endpoint prefix from the payload; the rest is the name.
+fn split_endpoint_name(payload: &[u8]) -> Result<(SocketAddr, String), ProtocolError> {
+    if payload.len() < 6 {
+        return Err(ProtocolError::TruncatedPayload {
+            declared: payload.len() as u16,
+            actual: 0,
+        });
+    }
+    let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+    let port = u16::from_be_bytes([payload[4], payload[5]]);
+    let name = utf8_name(&payload[6..])?;
+    Ok((SocketAddr::new(IpAddr::V4(ip), port), name))
+}
+
+/// Pack peer entries: 4-byte IPv4 octets + 2-byte big-endian port + 1 flag
+/// byte, per entry.
+fn encode_peers(peers: &[(SocketAddr, u8)]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(peers.len() * 7);
+    for (peer, flags) in peers {
         if let SocketAddr::V4(v4) = peer {
             payload.extend_from_slice(&v4.ip().octets());
             payload.extend_from_slice(&v4.port().to_be_bytes());
+            payload.push(*flags);
         }
     }
     payload
 }
 
 /// Decode packed peer entries; skips malformed ones (port 0, IPv6).
-fn decode_peers(payload: &[u8]) -> Result<Vec<SocketAddr>, ProtocolError> {
-    if payload.len() % 6 != 0 {
+fn decode_peers(payload: &[u8]) -> Result<Vec<(SocketAddr, u8)>, ProtocolError> {
+    if payload.len() % 7 != 0 {
         return Err(ProtocolError::BadPeerlistPayload { len: payload.len() });
     }
     let mut peers = Vec::new();
-    for chunk in payload.chunks_exact(6) {
+    for chunk in payload.chunks_exact(7) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         if port != 0 {
-            peers.push(SocketAddr::new(IpAddr::V4(ip), port));
+            peers.push((SocketAddr::new(IpAddr::V4(ip), port), chunk[6]));
         }
     }
     Ok(peers)
@@ -355,6 +419,16 @@ mod tests {
     #[test]
     fn roundtrip_handshake_request() {
         let msg = Message::HandshakeRequest {
+            claimed: SocketAddr::from(([203, 0, 113, 7], 54444)),
+            name: "peer-1".to_string(),
+        };
+        assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_handshake_request_no_mapping() {
+        let msg = Message::HandshakeRequest {
+            claimed: SocketAddr::from(([0, 0, 0, 0], 0)),
             name: "peer-1".to_string(),
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
@@ -363,9 +437,20 @@ mod tests {
     #[test]
     fn roundtrip_handshake_response() {
         let msg = Message::HandshakeResponse {
+            observed: SocketAddr::from(([203, 0, 113, 7], 54321)),
             name: "master".to_string(),
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_ping_pong() {
+        let ping = Message::Ping {
+            name: "peer-1".to_string(),
+        };
+        assert_eq!(decode(&encode(&ping)).unwrap(), ping);
+        let pong = Message::Pong;
+        assert_eq!(decode(&encode(&pong)).unwrap(), pong);
     }
 
     #[test]
@@ -436,8 +521,8 @@ mod tests {
     fn roundtrip_peerlist_response() {
         let msg = Message::PeerlistResponse {
             peers: vec![
-                SocketAddr::from(([127, 0, 0, 1], 4444)),
-                SocketAddr::from(([10, 0, 0, 2], 5555)),
+                (SocketAddr::from(([127, 0, 0, 1], 4444)), PEER_UPNP_MAPPED),
+                (SocketAddr::from(([10, 0, 0, 2], 5555)), 0),
             ],
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
@@ -447,14 +532,14 @@ mod tests {
     fn peerlist_response_wire_format() {
         let msg = Message::PeerlistResponse {
             peers: vec![
-                SocketAddr::from(([127, 0, 0, 1], 4444)),
-                SocketAddr::from(([10, 0, 0, 2], 5555)),
+                (SocketAddr::from(([127, 0, 0, 1], 4444)), PEER_UPNP_MAPPED),
+                (SocketAddr::from(([10, 0, 0, 2], 5555)), 0),
             ],
         };
         let expected: Vec<u8> = vec![
-            0x51, 0x53, 0x54, 0x02, 0x51, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x7F, 0x00, 0x00, 0x01, 0x11, 0x5C, // 127.0.0.1:4444
-            0x0A, 0x00, 0x00, 0x02, 0x15, 0xB3, // 10.0.0.2:5555
+            0x51, 0x53, 0x54, 0x03, 0x51, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7F, 0x00, 0x00, 0x01, 0x11, 0x5C, 0x01, // 127.0.0.1:4444, upnp
+            0x0A, 0x00, 0x00, 0x02, 0x15, 0xB3, 0x00, // 10.0.0.2:5555
         ];
         assert_eq!(encode(&msg), expected);
         assert_eq!(decode(&expected).unwrap(), msg);
@@ -463,10 +548,10 @@ mod tests {
     #[test]
     fn rejects_bad_peerlist_payload() {
         let msg = Message::PeerlistResponse {
-            peers: vec![SocketAddr::from(([127, 0, 0, 1], 4444))],
+            peers: vec![(SocketAddr::from(([127, 0, 0, 1], 4444)), 0)],
         };
         let mut datagram = encode(&msg);
-        // Declare a 5-byte payload instead of 6.
+        // Declare a 5-byte payload instead of 7.
         datagram[6] = 0x00;
         datagram[7] = 0x05;
         datagram.truncate(HEADER_SIZE + 5);
@@ -482,7 +567,7 @@ mod tests {
     fn manifest_request_wire_format() {
         let expected: Vec<u8> = vec![
             0x51, 0x53, 0x54, // magic QST
-            0x02, // version
+            0x03, // version
             0x20, // MANIFEST_REQUEST
             0x00, // flags
             0x00, 0x00, // data length
@@ -495,13 +580,41 @@ mod tests {
     }
 
     #[test]
+    fn handshake_request_wire_format() {
+        let msg = Message::HandshakeRequest {
+            claimed: SocketAddr::from(([203, 0, 113, 7], 54444)),
+            name: "peer-1".to_string(),
+        };
+        let mut expected: Vec<u8> = vec![
+            0x51, 0x53, 0x54, 0x03, 0x01, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xCB, 0x00, 0x71, 0x07, 0xD4, 0xAC, // claimed 203.0.113.7:54444
+        ];
+        expected.extend_from_slice(b"peer-1");
+        assert_eq!(encode(&msg), expected);
+        assert_eq!(decode(&expected).unwrap(), msg);
+    }
+
+    #[test]
+    fn ping_wire_format() {
+        let msg = Message::Ping {
+            name: "peer-1".to_string(),
+        };
+        let mut expected: Vec<u8> = vec![
+            0x51, 0x53, 0x54, 0x03, 0x60, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        expected.extend_from_slice(b"peer-1");
+        assert_eq!(encode(&msg), expected);
+        assert_eq!(decode(&expected).unwrap(), msg);
+    }
+
+    #[test]
     fn segment_request_wire_format() {
         let msg = Message::SegmentRequest {
             transfer_id: 0x01A7,
             filename: "seg_0042.ts".to_string(),
         };
         let mut expected: Vec<u8> = vec![
-            0x51, 0x53, 0x54, 0x02, 0x30, 0x00, 0x00, 0x0B, 0x01, 0xA7, 0x00, 0x00, 0x00, 0x00,
+            0x51, 0x53, 0x54, 0x03, 0x30, 0x00, 0x00, 0x0B, 0x01, 0xA7, 0x00, 0x00, 0x00, 0x00,
         ];
         expected.extend_from_slice(b"seg_0042.ts");
         assert_eq!(encode(&msg), expected);
@@ -517,7 +630,7 @@ mod tests {
             data: vec![0xAB; 1400],
         };
         let mut expected: Vec<u8> = vec![
-            0x51, 0x53, 0x54, 0x02, 0x31, 0x00, 0x05, 0x78, 0x01, 0xA7, 0x00, 0x01, 0x00, 0x3C,
+            0x51, 0x53, 0x54, 0x03, 0x31, 0x00, 0x05, 0x78, 0x01, 0xA7, 0x00, 0x01, 0x00, 0x3C,
         ];
         expected.extend(vec![0xAB; 1400]);
         assert_eq!(encode(&msg), expected);
@@ -533,7 +646,7 @@ mod tests {
             next_count: 5,
         };
         let expected: Vec<u8> = vec![
-            0x51, 0x53, 0x54, 0x02, 0x40, 0x00, 0x00, 0x04, 0x01, 0xA7, 0x00, 0x00, 0x00, 0x00,
+            0x51, 0x53, 0x54, 0x03, 0x40, 0x00, 0x00, 0x04, 0x01, 0xA7, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x06, 0x00, 0x05,
         ];
         assert_eq!(encode(&msg), expected);

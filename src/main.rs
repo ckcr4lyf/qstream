@@ -8,6 +8,7 @@ mod peer;
 mod protocol;
 mod server;
 mod transfer;
+mod upnp;
 
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
