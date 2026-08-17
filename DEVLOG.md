@@ -228,3 +228,12 @@ successful segment serves to VPS-2 over the same interval.
 **Remaining limitation:** segment downloads over the cross-VPS path are about
 250-315 KB/s and roughly 0.9-1.1 s per segment. The edge policy prevents bad
 peer trials, but pipelined windows remain the main throughput improvement.
+
+**Follow-up:** inventory is now announced immediately after a completed peer
+download, rather than only piggybacked on the 10-second PING/PONG cadence.
+`/peers` displays a fresh inventory as `newest=<n> mask=<hex>` for inspection.
+In a second cross-VPS run, VPS-2 saw the master's live inventory
+`newest=134505 mask=07ff`, completed 33 pulls with 0 failures in 66 seconds,
+and served `playback.m3u8` with HTTP 200. The legacy home peer exposes no
+inventory, as expected; it remains compatible but is not selected for the
+three-segment live edge.

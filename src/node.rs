@@ -997,9 +997,14 @@ impl Node {
                         let display = name.clone();
                         log::info(&format!("discovered peer {display} at {src} (ping)"));
                         self.register_peer(src, display);
-                        // If no same-name peer exists yet, this first
-                        // contact is likely a LAN beacon — prefer LAN paths.
-                        if !self.peers.iter().any(|(a, i)| i.name == name && *a != src) {
+                        // A first PING from a private or loopback source is
+                        // a LAN beacon. Public PINGs are punch probes and
+                        // must not be mislabeled as LAN paths in /peers.
+                        let is_lan_source = match src.ip() {
+                            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+                            IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local(),
+                        };
+                        if is_lan_source {
                             self.paths.get_mut(&src).map(|p| p.lan = true);
                         }
                     }
