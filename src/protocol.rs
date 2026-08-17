@@ -82,6 +82,21 @@ pub struct SegmentAvailability {
     pub mask: u16,
 }
 
+impl SegmentAvailability {
+    /// Whether this inventory explicitly covers `segment` and says it exists.
+    /// A segment outside the 16-entry window is unknown, not absent.
+    pub fn contains(&self, segment: u64) -> Option<bool> {
+        if segment > self.newest {
+            return None;
+        }
+        let distance = self.newest - segment;
+        if distance >= AVAILABILITY_MASK_BITS as u64 {
+            return None;
+        }
+        Some(self.mask & (1 << distance) != 0)
+    }
+}
+
 /// A decoded message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -565,6 +580,19 @@ mod tests {
             }),
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn availability_mask_represents_newest_first() {
+        let availability = SegmentAvailability {
+            newest: 100,
+            mask: 0b0101,
+        };
+        assert_eq!(availability.contains(100), Some(true));
+        assert_eq!(availability.contains(99), Some(false));
+        assert_eq!(availability.contains(98), Some(true));
+        assert_eq!(availability.contains(84), None);
+        assert_eq!(availability.contains(101), None);
     }
 
     #[test]

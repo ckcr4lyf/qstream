@@ -252,14 +252,10 @@ impl Node {
         let Some((availability, observed_at)) = self.availability.get(&peer) else {
             return true;
         };
-        if now.duration_since(*observed_at) > AVAILABILITY_TTL || number > availability.newest {
+        if now.duration_since(*observed_at) > AVAILABILITY_TTL {
             return true;
         }
-        let distance = availability.newest - number;
-        if distance >= protocol::AVAILABILITY_MASK_BITS as u64 {
-            return true;
-        }
-        availability.mask & (1 << distance) != 0
+        availability.contains(number).unwrap_or(true)
     }
 
     /// Resolve a peer address to the best address to reach it: if the same

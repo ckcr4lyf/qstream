@@ -196,3 +196,35 @@ segment; the peer itself was ~19 segments behind the live edge.
 **Also observed:** the home peer's peerlist showed `192.168.128.1:4447` —
 a LAN-beacon discovery of another qstream instance on the user's home
 network; benign (trial NOT_FOUND churn).
+
+## Live-edge scheduling and availability hints (2026-08-17) — VERIFIED
+
+**Problem:** a remote peer can discover a home peer that is several pieces
+behind the master. Trial-based selection then wastes requests on the home
+peer for fresh playlist entries that only the master can reliably serve.
+
+**Changes (protocol v3 compatible):**
+
+- The newest three manifest entries are master-only. Peers are still selected
+  for older backfill, where sharing has a chance to help.
+- `PONG` and `SEGMENT_NOT_FOUND` may now carry an optional 10-byte inventory:
+  `u64 newest segment number + u16 newest-first availability mask`. It covers
+  the most recent 16 pieces; old nodes send/accept the empty legacy payload.
+- An inventory expires after 15 seconds. A peer is skipped only when its fresh
+  inventory explicitly says it lacks a requested older piece; unknown and
+  out-of-window pieces remain trial candidates.
+
+**Local baseline:** after restart, peer-1 made 13 live pulls in 25 seconds,
+all from the master, with 0 `SEGMENT_NOT_FOUND` retries and 0 protocol decode
+errors.
+
+**Cross-VPS verification:** VPS-2 (`140.238.230.56`, peer UDP 4445) joined the
+master swarm while the home peer (`183.178.210.60:4450`) was lagging. Initial
+backfill used the home peer for 4 older pieces. In the following 103 seconds,
+VPS-2 completed 57 master pulls and 0 failures; it made 0 NOT_FOUND pulls to
+the home peer. HTTP `GET /playback.m3u8` returned 200. The master recorded 54
+successful segment serves to VPS-2 over the same interval.
+
+**Remaining limitation:** segment downloads over the cross-VPS path are about
+250-315 KB/s and roughly 0.9-1.1 s per segment. The edge policy prevents bad
+peer trials, but pipelined windows remain the main throughput improvement.
