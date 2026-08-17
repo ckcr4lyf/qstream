@@ -123,8 +123,8 @@ pub struct SenderTransfer {
     pub remote: SocketAddr,
     pub total_packets: u16,
     file: Vec<u8>,
-    range: (u16, u16),      // (start, count) of the current window
-    range_sent: u16,        // packets of the current window already sent
+    range: (u16, u16), // (start, count) of the current window
+    range_sent: u16,   // packets of the current window already sent
     retry_count: u32,
     ack_deadline: Option<Instant>, // armed once the window is fully sent
     send_deadline: Instant,        // when to send the next chunk
@@ -183,7 +183,8 @@ impl SenderTransfer {
             }
             if self.range_sent >= count {
                 self.window_sent_at = Some(now);
-                self.ack_deadline = Some(now + retry_interval(count, self.rtt_est, self.retry_count));
+                self.ack_deadline =
+                    Some(now + retry_interval(count, self.rtt_est, self.retry_count));
             }
         }
 
@@ -284,8 +285,8 @@ pub struct ReceiverTransfer {
     unresponsive: bool,
     not_found: bool,
     started_at: Instant,
-    gap_est: Duration,             // EWMA of inter-packet gaps (M5)
-    backoff: u32,                  // quiet-period backoff exponent
+    gap_est: Duration, // EWMA of inter-packet gaps (M5)
+    backoff: u32,      // quiet-period backoff exponent
     last_arrival: Option<Instant>,
     first_packet_latency: Option<u64>,
     request_resent: bool,
@@ -293,12 +294,7 @@ pub struct ReceiverTransfer {
 }
 
 impl ReceiverTransfer {
-    pub fn new(
-        transfer_id: u16,
-        remote: SocketAddr,
-        filename: String,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(transfer_id: u16, remote: SocketAddr, filename: String, data_dir: PathBuf) -> Self {
         let now = Instant::now();
         ReceiverTransfer {
             transfer_id,
@@ -432,7 +428,9 @@ impl ReceiverTransfer {
             return;
         }
 
-        let Some((start, count)) = self.range else { return };
+        let Some((start, count)) = self.range else {
+            return;
+        };
 
         if (packet_number as u32) < start as u32
             || (packet_number as u32) >= start as u32 + count as u32
@@ -469,16 +467,21 @@ impl ReceiverTransfer {
         }
     }
 
-    fn advance(&mut self, socket: &UdpSocket, fault: &mut FaultInjector, start: u16, count: u16, total: u16) {
+    fn advance(
+        &mut self,
+        socket: &UdpSocket,
+        fault: &mut FaultInjector,
+        start: u16,
+        count: u16,
+        total: u16,
+    ) {
         let next_start = start as u32 + count as u32;
         let remaining = total as u32 - next_start + 1;
         if remaining <= 0 {
             self.complete(socket, fault);
             return;
         }
-        let next_count = (count as u32 * 2)
-            .min(MAX_WINDOW as u32)
-            .min(remaining);
+        let next_count = (count as u32 * 2).min(MAX_WINDOW as u32).min(remaining);
         self.range = Some((next_start as u16, next_count as u16));
         self.retry_count = 0;
         self.quiet_deadline = Instant::now() + adaptive_quiet(self.gap_est, 0);
@@ -693,7 +696,9 @@ impl TransferRegistry {
         src: SocketAddr,
     ) {
         if !valid_filename(filename) {
-            log::warn(&format!("rejecting invalid filename {filename:?} from {src}"));
+            log::warn(&format!(
+                "rejecting invalid filename {filename:?} from {src}"
+            ));
             self.events.push(RegEvent::NotFound { src });
             self.send_not_found(socket, fault, transfer_id, src);
             return;
@@ -749,7 +754,8 @@ impl TransferRegistry {
             filename: filename.to_string(),
         };
         fault.send(socket, protocol::encode(&req), remote, Instant::now());
-        let receiver = ReceiverTransfer::new(id, remote, filename.to_string(), data_dir.to_path_buf());
+        let receiver =
+            ReceiverTransfer::new(id, remote, filename.to_string(), data_dir.to_path_buf());
         self.receivers.insert(id, receiver);
         Some(id)
     }
@@ -783,7 +789,9 @@ impl TransferRegistry {
     ) {
         if let Some(sender) = self.senders.get_mut(&transfer_id) {
             if sender.on_ack(ack_type, next_start, next_count) {
-                log::info(&format!("transfer {transfer_id:#06x} complete — sender freed"));
+                log::info(&format!(
+                    "transfer {transfer_id:#06x} complete — sender freed"
+                ));
                 self.senders.remove(&transfer_id);
             }
         } else {
@@ -817,7 +825,9 @@ impl TransferRegistry {
             r.mark_not_found();
             r.fail(format!("peer does not have {filename}"));
         } else {
-            log::trace(&format!("NOT_FOUND for unknown transfer {transfer_id:#06x}"));
+            log::trace(&format!(
+                "NOT_FOUND for unknown transfer {transfer_id:#06x}"
+            ));
         }
     }
 
@@ -827,22 +837,32 @@ impl TransferRegistry {
 
     /// Whether the receiver failed because its peer never answered.
     pub fn receiver_unresponsive(&self, id: u16) -> bool {
-        self.receivers.get(&id).map(ReceiverTransfer::unresponsive).unwrap_or(false)
+        self.receivers
+            .get(&id)
+            .map(ReceiverTransfer::unresponsive)
+            .unwrap_or(false)
     }
 
     /// Whether the receiver failed because the peer lacks the segment.
     pub fn receiver_not_found(&self, id: u16) -> bool {
-        self.receivers.get(&id).map(ReceiverTransfer::not_found).unwrap_or(false)
+        self.receivers
+            .get(&id)
+            .map(ReceiverTransfer::not_found)
+            .unwrap_or(false)
     }
 
     /// Milliseconds from request to first content packet, if it got that far.
     pub fn receiver_first_packet_ms(&self, id: u16) -> Option<u64> {
-        self.receivers.get(&id).and_then(ReceiverTransfer::first_packet_latency_ms)
+        self.receivers
+            .get(&id)
+            .and_then(ReceiverTransfer::first_packet_latency_ms)
     }
 
     /// Bytes written to disk for a completed receiver.
     pub fn receiver_saved_bytes(&self, id: u16) -> Option<u64> {
-        self.receivers.get(&id).and_then(ReceiverTransfer::saved_bytes)
+        self.receivers
+            .get(&id)
+            .and_then(ReceiverTransfer::saved_bytes)
     }
 
     pub fn remove_receiver(&mut self, id: u16) {

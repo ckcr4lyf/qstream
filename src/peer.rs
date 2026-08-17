@@ -402,6 +402,7 @@ fn schedule_jobs(
                 refresh_playback_manifest(data_dir, playback_holdback).unwrap_or_else(|e| {
                     log::warn(&format!("playback manifest update failed: {e}"))
                 });
+                node.announce_availability();
                 log::info(&format!("segment {} saved", job.filename));
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);

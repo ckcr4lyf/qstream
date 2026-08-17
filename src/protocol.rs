@@ -14,7 +14,7 @@ pub const AVAILABILITY_MASK_BITS: u32 = 16;
 
 /// Peerlist entry flags (N1):
 pub const PEER_UPNP_MAPPED: u8 = 0x01; // claimed endpoint == observed (verified mapping)
-pub const PEER_SAME_IP: u8 = 0x02;     // same public IP as the requester (likely same NAT)
+pub const PEER_SAME_IP: u8 = 0x02; // same public IP as the requester (likely same NAT)
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +145,9 @@ pub enum Message {
     Ping { nonce: u32, name: String },
     /// PONG — optionally carries the sender's compact recent segment
     /// inventory. Empty payload remains compatible with older nodes.
-    Pong { availability: Option<SegmentAvailability> },
+    Pong {
+        availability: Option<SegmentAvailability>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +190,10 @@ impl fmt::Display for ProtocolError {
                 write!(f, "unknown message type: {code:#04x}")
             }
             ProtocolError::TruncatedPayload { declared, actual } => {
-                write!(f, "payload truncated: header says {declared} bytes, datagram has {actual}")
+                write!(
+                    f,
+                    "payload truncated: header says {declared} bytes, datagram has {actual}"
+                )
             }
             ProtocolError::InvalidUtf8 => write!(f, "payload is not valid UTF-8"),
             ProtocolError::BadAckFlags { got } => {
@@ -198,10 +203,16 @@ impl fmt::Display for ProtocolError {
                 write!(f, "progress ACK payload must be 4 bytes, got {len}")
             }
             ProtocolError::BadPeerlistPayload { len } => {
-                write!(f, "peerlist payload must be a multiple of 7 bytes, got {len}")
+                write!(
+                    f,
+                    "peerlist payload must be a multiple of 7 bytes, got {len}"
+                )
             }
             ProtocolError::BadAvailabilityPayload { len } => {
-                write!(f, "availability payload must be empty or 10 bytes, got {len}")
+                write!(
+                    f,
+                    "availability payload must be empty or 10 bytes, got {len}"
+                )
             }
         }
     }
@@ -211,40 +222,45 @@ impl std::error::Error for ProtocolError {}
 
 /// Encode a message into a datagram buffer (header + payload).
 pub fn encode(message: &Message) -> Vec<u8> {
-    let (message_type, flags, transfer_id, packet_number, total_packets): (MessageType, u8, u16, u16, u16) =
-        match message {
-            Message::HandshakeRequest { .. } => (MessageType::HandshakeRequest, 0, 0, 0, 0),
-            Message::HandshakeResponse { .. } => (MessageType::HandshakeResponse, 0, 0, 0, 0),
-            Message::ManifestRequest => (MessageType::ManifestRequest, 0, 0, 0, 0),
-            Message::ManifestResponse { .. } => (MessageType::ManifestResponse, 0, 0, 0, 0),
-            Message::SegmentRequest { transfer_id, .. } => {
-                (MessageType::SegmentRequest, 0, *transfer_id, 0, 0)
-            }
-            Message::SegmentContents {
-                transfer_id,
-                packet_number,
-                total_packets,
-                ..
-            } => (
-                MessageType::SegmentContents,
-                0,
-                *transfer_id,
-                *packet_number,
-                *total_packets,
-            ),
-            Message::SegmentNotFound { transfer_id, .. } => {
-                (MessageType::SegmentNotFound, 0, *transfer_id, 0, 0)
-            }
-            Message::Ack {
-                transfer_id,
-                ack_type,
-                ..
-            } => (MessageType::Ack, *ack_type as u8, *transfer_id, 0, 0),
-            Message::PeerlistRequest => (MessageType::PeerlistRequest, 0, 0, 0, 0),
-            Message::PeerlistResponse { .. } => (MessageType::PeerlistResponse, 0, 0, 0, 0),
-            Message::Ping { .. } => (MessageType::Ping, 0, 0, 0, 0),
-            Message::Pong { .. } => (MessageType::Pong, 0, 0, 0, 0),
-        };
+    let (message_type, flags, transfer_id, packet_number, total_packets): (
+        MessageType,
+        u8,
+        u16,
+        u16,
+        u16,
+    ) = match message {
+        Message::HandshakeRequest { .. } => (MessageType::HandshakeRequest, 0, 0, 0, 0),
+        Message::HandshakeResponse { .. } => (MessageType::HandshakeResponse, 0, 0, 0, 0),
+        Message::ManifestRequest => (MessageType::ManifestRequest, 0, 0, 0, 0),
+        Message::ManifestResponse { .. } => (MessageType::ManifestResponse, 0, 0, 0, 0),
+        Message::SegmentRequest { transfer_id, .. } => {
+            (MessageType::SegmentRequest, 0, *transfer_id, 0, 0)
+        }
+        Message::SegmentContents {
+            transfer_id,
+            packet_number,
+            total_packets,
+            ..
+        } => (
+            MessageType::SegmentContents,
+            0,
+            *transfer_id,
+            *packet_number,
+            *total_packets,
+        ),
+        Message::SegmentNotFound { transfer_id, .. } => {
+            (MessageType::SegmentNotFound, 0, *transfer_id, 0, 0)
+        }
+        Message::Ack {
+            transfer_id,
+            ack_type,
+            ..
+        } => (MessageType::Ack, *ack_type as u8, *transfer_id, 0, 0),
+        Message::PeerlistRequest => (MessageType::PeerlistRequest, 0, 0, 0, 0),
+        Message::PeerlistResponse { .. } => (MessageType::PeerlistResponse, 0, 0, 0, 0),
+        Message::Ping { .. } => (MessageType::Ping, 0, 0, 0, 0),
+        Message::Pong { .. } => (MessageType::Pong, 0, 0, 0, 0),
+    };
 
     let payload: Vec<u8> = match message {
         Message::HandshakeRequest { claimed, name } => {
@@ -303,7 +319,9 @@ pub fn encode(message: &Message) -> Vec<u8> {
 /// Decode a datagram into a message, validating magic, version and lengths.
 pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
     if datagram.len() < HEADER_SIZE {
-        return Err(ProtocolError::TruncatedHeader { len: datagram.len() });
+        return Err(ProtocolError::TruncatedHeader {
+            len: datagram.len(),
+        });
     }
 
     let magic = [datagram[0], datagram[1], datagram[2]];
@@ -361,7 +379,8 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
             availability: decode_availability(payload)?,
         },
         MessageType::Ack => {
-            let ack_type = AckType::from_u8(flags).ok_or(ProtocolError::BadAckFlags { got: flags })?;
+            let ack_type =
+                AckType::from_u8(flags).ok_or(ProtocolError::BadAckFlags { got: flags })?;
             match ack_type {
                 AckType::Complete => Message::Ack {
                     transfer_id,

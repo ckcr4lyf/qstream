@@ -186,7 +186,9 @@ impl Node {
         if fault.enabled() {
             log::info(&fault.summary());
         }
-        let local_addr = socket.local_addr().unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let local_addr = socket
+            .local_addr()
+            .unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
         let beacon_nonce = crate::fault::Rng::new(0).next() as u32;
         Node {
             socket,
@@ -238,8 +240,26 @@ impl Node {
     }
 
     /// Record a peer's compact recent segment inventory.
-    pub fn record_availability(&mut self, peer: SocketAddr, availability: protocol::SegmentAvailability) {
-        self.availability.insert(peer, (availability, Instant::now()));
+    pub fn record_availability(
+        &mut self,
+        peer: SocketAddr,
+        availability: protocol::SegmentAvailability,
+    ) {
+        self.availability
+            .insert(peer, (availability, Instant::now()));
+    }
+
+    /// Push the current store inventory to known peers after a segment lands.
+    /// This is an unsolicited PONG by design: it remains decodable by legacy
+    /// peers and avoids waiting for the next 10-second keep-alive cycle.
+    pub fn announce_availability(&mut self) {
+        let pong = Message::Pong {
+            availability: self.registry.segment_availability(),
+        };
+        let bytes = protocol::encode(&pong);
+        for peer in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.send(&bytes, peer);
+        }
     }
 
     /// Return false only when a recent inventory explicitly says the peer
@@ -341,8 +361,15 @@ impl Node {
         latency_ms: Option<u64>,
         bytes: u64,
     ) {
-        let name = self.peers.get(&peer).map(|p| p.name.clone()).unwrap_or_else(|| peer.to_string());
-        let stat = self.peer_stats.entry(peer).or_insert_with(|| PeerStat::new(name));
+        let name = self
+            .peers
+            .get(&peer)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| peer.to_string());
+        let stat = self
+            .peer_stats
+            .entry(peer)
+            .or_insert_with(|| PeerStat::new(name));
         stat.last_seen = Instant::now();
         match result {
             PullResult::Ok => {
@@ -377,8 +404,15 @@ impl Node {
 
     /// Record how a serve to `peer` ended (server-side ranking input).
     pub fn record_serve(&mut self, peer: SocketAddr, result: ServeResult, bytes: u64) {
-        let name = self.peers.get(&peer).map(|p| p.name.clone()).unwrap_or_else(|| peer.to_string());
-        let stat = self.peer_stats.entry(peer).or_insert_with(|| PeerStat::new(name));
+        let name = self
+            .peers
+            .get(&peer)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| peer.to_string());
+        let stat = self
+            .peer_stats
+            .entry(peer)
+            .or_insert_with(|| PeerStat::new(name));
         match result {
             ServeResult::Served => {
                 stat.served += 1;
@@ -411,9 +445,13 @@ impl Node {
         // Turn serve outcomes into peer stats.
         for event in self.registry.drain_events() {
             match event {
-                RegEvent::Served { src, bytes } => self.record_serve(src, ServeResult::Served, bytes),
+                RegEvent::Served { src, bytes } => {
+                    self.record_serve(src, ServeResult::Served, bytes)
+                }
                 RegEvent::NotFound { src } => self.record_serve(src, ServeResult::NotFound, 0),
-                RegEvent::SenderFailed { src } => self.record_serve(src, ServeResult::SenderFailed, 0),
+                RegEvent::SenderFailed { src } => {
+                    self.record_serve(src, ServeResult::SenderFailed, 0)
+                }
             }
         }
 
@@ -461,7 +499,8 @@ impl Node {
         }
         self.next_prune = now + Duration::from_secs(30);
         let manifest = fs::read(&self.manifest_path).unwrap_or_default();
-        let in_playlist: HashSet<String> = transfer::parse_manifest(&manifest).into_iter().collect();
+        let in_playlist: HashSet<String> =
+            transfer::parse_manifest(&manifest).into_iter().collect();
         let retention = Duration::from_secs(self.retention_secs);
         let root = self.registry.segment_root().to_path_buf();
         let Ok(entries) = fs::read_dir(&root) else {
@@ -478,8 +517,12 @@ impl Node {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
-            let Ok(age) = SystemTime::now().duration_since(modified) else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(age) = SystemTime::now().duration_since(modified) else {
+                continue;
+            };
             if age >= retention {
                 match fs::remove_file(entry.path()) {
                     Ok(()) => log::debug(&format!("pruned old segment {name}")),
@@ -543,7 +586,10 @@ impl Node {
         if let Ok(entries) = std::fs::read_dir(root) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if let Some(rest) = name.strip_prefix("seg_").and_then(|n| n.strip_suffix(".ts")) {
+                if let Some(rest) = name
+                    .strip_prefix("seg_")
+                    .and_then(|n| n.strip_suffix(".ts"))
+                {
                     if let Ok(num) = rest.parse::<u64>() {
                         count += 1;
                         newest = newest.max(num);
@@ -559,7 +605,11 @@ impl Node {
         // the second field, in pages.
         std::fs::read_to_string("/proc/self/statm")
             .ok()
-            .and_then(|s| s.split_whitespace().nth(1).map(|p| p.parse::<u64>().unwrap_or(0)))
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .map(|p| p.parse::<u64>().unwrap_or(0))
+            })
             .map(|pages| pages * 4096)
             .unwrap_or(0)
     }
@@ -578,10 +628,21 @@ impl Node {
                 Some(p) if p.fresh(now) => "fresh".to_string(),
                 _ => "stale".to_string(),
             };
+            let inventory = self
+                .availability
+                .get(addr)
+                .filter(|(_, observed)| now.duration_since(*observed) <= Duration::from_secs(15))
+                .map(|(availability, _)| {
+                    format!(
+                        " newest={} mask={:04x}",
+                        availability.newest, availability.mask
+                    )
+                })
+                .unwrap_or_default();
             lines.push(format!(
-                "peer {} {} score={} pulls={} nf_pulls={} timeouts={} other_fails={} served={} nf_served={} sender_fails={} latency={}ms path={}",
+                "peer {} {} score={} pulls={} nf_pulls={} timeouts={} other_fails={} served={} nf_served={} sender_fails={} latency={}ms path={}{}",
                 s.name, addr, s.score, s.pulls, s.nf_pulls, s.timeouts, s.other_fails,
-                s.served, s.nf_served, s.sender_fails, s.latency_ms, path
+                s.served, s.nf_served, s.sender_fails, s.latency_ms, path, inventory
             ));
         }
         if self.fault.enabled() {
@@ -660,29 +721,117 @@ impl Node {
     /// a `node` label; per-peer series carry a `peer` label.
     fn metrics_text(&self, now: Instant) -> String {
         const DEFS: &[(&str, &str, &str)] = &[
-            ("qstream_uptime_seconds", "Seconds since node start.", "gauge"),
-            ("qstream_peers_in_swarm", "Number of peers currently known to this node.", "gauge"),
-            ("qstream_downloaded_segments_total", "Segments fully downloaded by this node.", "counter"),
-            ("qstream_downloaded_bytes_total", "Bytes fully downloaded by this node.", "counter"),
-            ("qstream_uploaded_segments_total", "Segments served to other nodes.", "counter"),
-            ("qstream_uploaded_bytes_total", "Bytes served to other nodes.", "counter"),
-            ("qstream_store_segments", "Segments currently in the local store.", "gauge"),
-            ("qstream_store_bytes", "Bytes currently in the local store.", "gauge"),
-            ("qstream_edge_segment", "Newest segment number in the synced manifest.", "gauge"),
-            ("qstream_local_newest", "Newest segment number in the local store.", "gauge"),
-            ("qstream_catch_up", "Segments behind the live edge (0 = caught up).", "gauge"),
-            ("qstream_active_transfers", "In-flight senders + receivers.", "gauge"),
-            ("qstream_queue_depth", "Pending segment pulls in the queue.", "gauge"),
+            (
+                "qstream_uptime_seconds",
+                "Seconds since node start.",
+                "gauge",
+            ),
+            (
+                "qstream_peers_in_swarm",
+                "Number of peers currently known to this node.",
+                "gauge",
+            ),
+            (
+                "qstream_downloaded_segments_total",
+                "Segments fully downloaded by this node.",
+                "counter",
+            ),
+            (
+                "qstream_downloaded_bytes_total",
+                "Bytes fully downloaded by this node.",
+                "counter",
+            ),
+            (
+                "qstream_uploaded_segments_total",
+                "Segments served to other nodes.",
+                "counter",
+            ),
+            (
+                "qstream_uploaded_bytes_total",
+                "Bytes served to other nodes.",
+                "counter",
+            ),
+            (
+                "qstream_store_segments",
+                "Segments currently in the local store.",
+                "gauge",
+            ),
+            (
+                "qstream_store_bytes",
+                "Bytes currently in the local store.",
+                "gauge",
+            ),
+            (
+                "qstream_edge_segment",
+                "Newest segment number in the synced manifest.",
+                "gauge",
+            ),
+            (
+                "qstream_local_newest",
+                "Newest segment number in the local store.",
+                "gauge",
+            ),
+            (
+                "qstream_catch_up",
+                "Segments behind the live edge (0 = caught up).",
+                "gauge",
+            ),
+            (
+                "qstream_active_transfers",
+                "In-flight senders + receivers.",
+                "gauge",
+            ),
+            (
+                "qstream_queue_depth",
+                "Pending segment pulls in the queue.",
+                "gauge",
+            ),
             ("qstream_inflight", "Active pull jobs.", "gauge"),
-            ("qstream_rss_bytes", "Resident memory of this process.", "gauge"),
-            ("qstream_fault_dropped_total", "Datagrams dropped by fault injection.", "counter"),
-            ("qstream_fault_emitted_total", "Datagrams emitted by fault injection.", "counter"),
-            ("qstream_peer_score", "Quality score 0-100 for a known peer.", "gauge"),
-            ("qstream_peer_pulls_total", "Successful pulls from a peer.", "counter"),
-            ("qstream_peer_nf_pulls_total", "NOT_FOUND responses from a peer.", "counter"),
-            ("qstream_peer_timeouts_total", "No-response failures from a peer.", "counter"),
-            ("qstream_peer_served_total", "Segments served to a peer.", "counter"),
-            ("qstream_peer_latency_ms", "EWMA first-packet latency to a peer.", "gauge"),
+            (
+                "qstream_rss_bytes",
+                "Resident memory of this process.",
+                "gauge",
+            ),
+            (
+                "qstream_fault_dropped_total",
+                "Datagrams dropped by fault injection.",
+                "counter",
+            ),
+            (
+                "qstream_fault_emitted_total",
+                "Datagrams emitted by fault injection.",
+                "counter",
+            ),
+            (
+                "qstream_peer_score",
+                "Quality score 0-100 for a known peer.",
+                "gauge",
+            ),
+            (
+                "qstream_peer_pulls_total",
+                "Successful pulls from a peer.",
+                "counter",
+            ),
+            (
+                "qstream_peer_nf_pulls_total",
+                "NOT_FOUND responses from a peer.",
+                "counter",
+            ),
+            (
+                "qstream_peer_timeouts_total",
+                "No-response failures from a peer.",
+                "counter",
+            ),
+            (
+                "qstream_peer_served_total",
+                "Segments served to a peer.",
+                "counter",
+            ),
+            (
+                "qstream_peer_latency_ms",
+                "EWMA first-packet latency to a peer.",
+                "gauge",
+            ),
         ];
 
         let mut out = String::with_capacity(4096);
@@ -700,7 +849,11 @@ impl Node {
 
         s("qstream_uptime_seconds", &nl, uptime);
         s("qstream_peers_in_swarm", &nl, self.peers.len() as u64);
-        s("qstream_downloaded_segments_total", &nl, self.downloaded_total);
+        s(
+            "qstream_downloaded_segments_total",
+            &nl,
+            self.downloaded_total,
+        );
         s("qstream_downloaded_bytes_total", &nl, self.downloaded_bytes);
         s("qstream_uploaded_segments_total", &nl, self.served_total);
         s("qstream_uploaded_bytes_total", &nl, self.served_bytes);
@@ -709,7 +862,11 @@ impl Node {
         s("qstream_edge_segment", &nl, edge);
         s("qstream_local_newest", &nl, local_newest);
         s("qstream_catch_up", &nl, edge.saturating_sub(local_newest));
-        s("qstream_active_transfers", &nl, self.registry.active_count() as u64);
+        s(
+            "qstream_active_transfers",
+            &nl,
+            self.registry.active_count() as u64,
+        );
         s("qstream_queue_depth", &nl, self.queue_depth);
         s("qstream_inflight", &nl, self.inflight);
         s("qstream_rss_bytes", &nl, Self::rss_bytes());
@@ -752,8 +909,15 @@ impl Node {
             .map(|(_, s)| {
                 format!(
                     "{} {} (pull {}/{}/{}/{} served {}/{}/{})",
-                    s.name, s.score, s.pulls, s.nf_pulls, s.timeouts, s.other_fails,
-                    s.served, s.nf_served, s.sender_fails
+                    s.name,
+                    s.score,
+                    s.pulls,
+                    s.nf_pulls,
+                    s.timeouts,
+                    s.other_fails,
+                    s.served,
+                    s.nf_served,
+                    s.sender_fails
                 )
             })
             .collect();
@@ -788,7 +952,9 @@ impl Node {
             Message::HandshakeResponse { observed, name } => {
                 log::debug(&format!("handshake response from {src} (name: {name})"));
                 if self.my_public != Some(observed) {
-                    log::info(&format!("my public endpoint (as seen by {src}): {observed}"));
+                    log::info(&format!(
+                        "my public endpoint (as seen by {src}): {observed}"
+                    ));
                 }
                 self.my_public = Some(observed);
                 Event::HandshakeResponse { src, name }
@@ -833,11 +999,7 @@ impl Node {
                         self.register_peer(src, display);
                         // If no same-name peer exists yet, this first
                         // contact is likely a LAN beacon — prefer LAN paths.
-                        if !self
-                            .peers
-                            .iter()
-                            .any(|(a, i)| i.name == name && *a != src)
-                        {
+                        if !self.peers.iter().any(|(a, i)| i.name == name && *a != src) {
                             self.paths.get_mut(&src).map(|p| p.lan = true);
                         }
                     }
@@ -864,7 +1026,10 @@ impl Node {
                 Event::None
             }
             Message::ManifestResponse { data } => {
-                log::debug(&format!("manifest response ({} bytes) from {src}", data.len()));
+                log::debug(&format!(
+                    "manifest response ({} bytes) from {src}",
+                    data.len()
+                ));
                 Event::ManifestResponse { data }
             }
             Message::PeerlistRequest => {
@@ -899,7 +1064,10 @@ impl Node {
                 Event::None
             }
             Message::PeerlistResponse { peers } => {
-                log::debug(&format!("peerlist response ({} peers) from {src}", peers.len()));
+                log::debug(&format!(
+                    "peerlist response ({} peers) from {src}",
+                    peers.len()
+                ));
                 Event::PeerlistResponse { peers }
             }
             Message::SegmentRequest {
@@ -943,7 +1111,8 @@ impl Node {
                 next_start,
                 next_count,
             } => {
-                self.registry.on_ack(transfer_id, ack_type, next_start, next_count, src);
+                self.registry
+                    .on_ack(transfer_id, ack_type, next_start, next_count, src);
                 Event::None
             }
         }
