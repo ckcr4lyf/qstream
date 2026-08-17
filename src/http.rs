@@ -14,7 +14,7 @@ use std::thread;
 
 use crate::log;
 use crate::node::StatsSnapshot;
-use crate::transfer::valid_filename;
+use crate::transfer::{self, valid_filename};
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
@@ -149,6 +149,10 @@ fn handle_connection(
         return;
     }
 
+    if name.ends_with(".ts") {
+        log_playback_request(&root, name);
+    }
+
     if !valid_filename(name) {
         respond(
             &mut stream,
@@ -281,6 +285,53 @@ pub fn playback_playlist(
         final_out.extend_from_slice(insert.as_bytes());
     }
     Some(final_out)
+}
+
+fn log_playback_request(root: &std::path::Path, requested: &str) {
+    let manifest = fs::read(root.join("live.m3u8")).unwrap_or_default();
+    let manifest_text = String::from_utf8_lossy(&manifest);
+    let segments = transfer::parse_manifest(&manifest);
+    let latest = segments
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let media_sequence = manifest_text
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let target_duration = manifest_text
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-TARGETDURATION:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let requested_sequence = segments
+        .iter()
+        .position(|segment| segment == requested)
+        .and_then(|position| media_sequence.map(|base| base + position as u64))
+        .or_else(|| segment_number(requested));
+    let latest_sequence = segments
+        .len()
+        .checked_sub(1)
+        .and_then(|last| media_sequence.map(|base| base + last as u64))
+        .or_else(|| segment_number(&latest));
+
+    match (requested_sequence, latest_sequence) {
+        (Some(requested_seq), Some(latest_seq)) => {
+            let behind = latest_seq.saturating_sub(requested_seq);
+            let delay_seconds = behind.saturating_mul(target_duration);
+            log::info(&format!(
+                "http: playback piece requested {requested}; master tip {latest}; approx delay {delay_seconds}s ({behind} segments)"
+            ));
+        }
+        _ => log::info(&format!(
+            "http: playback piece requested {requested}; master tip {latest}; approx delay unknown"
+        )),
+    }
+}
+
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
 }
 
 fn mime_of(name: &str) -> &'static str {
