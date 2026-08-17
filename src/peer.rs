@@ -43,6 +43,10 @@ const MAX_INFLIGHT_PER_PEER: usize = 2;
 /// Unresponsive pulls before a peer is evicted (M5: one timeout can just
 /// be a bad moment; three is a pattern).
 const EVICT_AFTER_UNRESPONSIVE: u32 = 3;
+/// Keep this many complete segments beyond the player-facing edge. With the
+/// default 2-second HLS segments, three entries give playback about 6 seconds
+/// to absorb replication jitter without delaying swarm synchronization.
+const DEFAULT_PLAYBACK_HOLDBACK_SEGMENTS: usize = 3;
 
 /// An in-flight download: which file from which peer.
 struct ActiveJob {
@@ -59,6 +63,10 @@ pub fn run(
 ) -> io::Result<()> {
     let data_dir = PathBuf::from(data_dir);
     fs::create_dir_all(&data_dir)?;
+    // `playback.m3u8` is derived from local files, never protocol state. A
+    // prior run's version could name segments that no longer exist.
+    let _ = fs::remove_file(data_dir.join("playback.m3u8"));
+    let playback_holdback = playback_holdback_segments();
 
     let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
     let _ = socket.set_broadcast(true); // LAN beacon (N3)
@@ -161,10 +169,15 @@ pub fn run(
             Ok((n, src)) => {
                 let now = Instant::now();
                 match node.handle(&buf[..n], src) {
-                    Event::HandshakeResponse { src, name: peer_name } => {
+                    Event::HandshakeResponse {
+                        src,
+                        name: peer_name,
+                    } => {
                         node.register_peer(src, peer_name.clone());
                         if src == remote && !handshake_done {
-                            log::info(&format!("handshake OK — bootstrap {src} (name: {peer_name})"));
+                            log::info(&format!(
+                                "handshake OK — bootstrap {src} (name: {peer_name})"
+                            ));
                             handshake_done = true;
                             next_poll = Instant::now();
                             next_peerlist = Instant::now();
@@ -176,14 +189,23 @@ pub fn run(
                     Event::ManifestResponse { data } => {
                         if !data.is_empty() {
                             if write_manifest(&data_dir, &data)? {
-                                sync_queue(&data_dir, &data, &mut pull_queue, &mut queued, &failed_at);
+                                sync_queue(
+                                    &data_dir,
+                                    &data,
+                                    &mut pull_queue,
+                                    &mut queued,
+                                    &failed_at,
+                                );
+                                refresh_playback_manifest(&data_dir, playback_holdback)?;
                                 log::info(&format!(
                                     "manifest updated ({} segments)",
                                     segment_count(&data)
                                 ));
                             }
                         } else {
-                            log::warn("bootstrap returned an empty manifest — keeping previous copy");
+                            log::warn(
+                                "bootstrap returned an empty manifest — keeping previous copy",
+                            );
                         }
                         poll_timeout = None;
                     }
@@ -231,8 +253,8 @@ pub fn run(
                 }
             }
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => {}
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
             Err(e) => return Err(e),
         }
 
@@ -250,7 +272,9 @@ pub fn run(
                 name: name.to_string(),
             };
             node.send(&protocol::encode(&req), remote);
-            log::warn(&format!("bootstrap handshake unanswered — retrying {remote}"));
+            log::warn(&format!(
+                "bootstrap handshake unanswered — retrying {remote}"
+            ));
             next_handshake_retry = now + HANDSHAKE_TIMEOUT;
         }
 
@@ -296,6 +320,7 @@ pub fn run(
             &mut failed_at,
             &mut unresponsive_hits,
             &data_dir,
+            playback_holdback,
             local_addr,
             remote,
             &mut rng,
@@ -316,13 +341,22 @@ fn schedule_jobs(
     failed_at: &mut HashMap<String, Instant>,
     unresponsive_hits: &mut HashMap<SocketAddr, u32>,
     data_dir: &Path,
+    playback_holdback: usize,
     local_addr: SocketAddr,
     bootstrap: SocketAddr,
     rng: &mut Rng,
     now: Instant,
 ) {
     // 1. Reap finished receivers.
-    let finished: Vec<(u16, ActiveJob, Result<(), String>, bool, bool, Option<u64>, Option<u64>)> = {
+    let finished: Vec<(
+        u16,
+        ActiveJob,
+        Result<(), String>,
+        bool,
+        bool,
+        Option<u64>,
+        Option<u64>,
+    )> = {
         let mut v = Vec::new();
         for (id, job) in active.iter() {
             if let Some(outcome) = node.registry.receiver_outcome(*id) {
@@ -362,6 +396,9 @@ fn schedule_jobs(
         node.record_pull(job.peer, result, latency, bytes.unwrap_or(0));
         match result {
             PullResult::Ok => {
+                refresh_playback_manifest(data_dir, playback_holdback).unwrap_or_else(|e| {
+                    log::warn(&format!("playback manifest update failed: {e}"))
+                });
                 log::info(&format!("segment {} saved", job.filename));
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);
@@ -371,7 +408,11 @@ fn schedule_jobs(
                 // lost (M5); the registry removes it after COMPLETE_GRACE.
             }
             _ => {
-                log::warn(&format!("segment {} pull failed: {}", job.filename, outcome.unwrap_err()));
+                log::warn(&format!(
+                    "segment {} pull failed: {}",
+                    job.filename,
+                    outcome.unwrap_err()
+                ));
                 if unresponsive {
                     // Peer never answered — count it; evict only after a
                     // pattern (M5), so a burst or slow link isn't fatal.
@@ -407,14 +448,22 @@ fn schedule_jobs(
 
     // 2. Fill free slots.
     while active.len() < MAX_PARALLEL_DOWNLOADS {
-        let Some(filename) = queue.pop_front() else { break };
-        let Some(peer) = pick_peer(node, active, tried, &filename, local_addr, bootstrap, rng) else {
+        let Some(filename) = queue.pop_front() else {
+            break;
+        };
+        let Some(peer) = pick_peer(node, active, tried, &filename, local_addr, bootstrap, rng)
+        else {
             queue.push_front(filename);
             break;
         };
-        match node.registry.start_receiver(&node.socket, &mut node.fault, peer, data_dir, &filename) {
+        match node
+            .registry
+            .start_receiver(&node.socket, &mut node.fault, peer, data_dir, &filename)
+        {
             Some(id) => {
-                log::info(&format!("pulling {filename} from {peer} (transfer {id:#06x})"));
+                log::info(&format!(
+                    "pulling {filename} from {peer} (transfer {id:#06x})"
+                ));
                 active.insert(
                     id,
                     ActiveJob {
@@ -462,7 +511,11 @@ fn pick_peer(
     }
     let weight = |p: &SocketAddr| -> f64 {
         let inflight = inflight(p) as f64;
-        let score = node.peer_stats.get(p).map(|s| s.score as f64).unwrap_or(50.0);
+        let score = node
+            .peer_stats
+            .get(p)
+            .map(|s| s.score as f64)
+            .unwrap_or(50.0);
         let fresh = if node.path_fresh(*p, now) { 1.25 } else { 0.7 };
         let mut w = (score + 1.0) / (inflight + 1.0) * fresh;
         if *p == bootstrap {
@@ -495,6 +548,30 @@ fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
 
 fn segment_count(data: &[u8]) -> usize {
     transfer::parse_manifest(data).len()
+}
+
+fn playback_holdback_segments() -> usize {
+    std::env::var("QSTREAM_PLAYBACK_HOLDBACK_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_PLAYBACK_HOLDBACK_SEGMENTS)
+}
+
+/// Atomically update the player-only playlist. `live.m3u8` remains the raw
+/// master manifest used for synchronization and UDP manifest responses.
+fn refresh_playback_manifest(data_dir: &Path, holdback_segments: usize) -> io::Result<()> {
+    let manifest = fs::read(data_dir.join("live.m3u8"))?;
+    let playback = data_dir.join("playback.m3u8");
+    let Some(data) = http::playback_playlist(data_dir, &manifest, holdback_segments) else {
+        let _ = fs::remove_file(playback);
+        return Ok(());
+    };
+    if fs::read(&playback).map(|old| old == data).unwrap_or(false) {
+        return Ok(());
+    }
+    let tmp = data_dir.join("playback.m3u8.tmp");
+    fs::write(&tmp, data)?;
+    fs::rename(tmp, playback)
 }
 
 /// Enqueue manifest segments that are missing locally and not already

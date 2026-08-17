@@ -23,7 +23,10 @@ const MAX_REQUEST_BYTES: usize = 8192;
 /// stats document (M5).
 pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<StatsSnapshot>>>) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
-    log::info(&format!("http: serving {} on 0.0.0.0:{port}", root.display()));
+    log::info(&format!(
+        "http: serving {} on 0.0.0.0:{port}",
+        root.display()
+    ));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -37,7 +40,11 @@ pub fn serve(root: PathBuf, port: u16, stats: Option<Arc<Mutex<StatsSnapshot>>>)
     Ok(())
 }
 
-fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mut stream: TcpStream) {
+fn handle_connection(
+    root: PathBuf,
+    stats: Option<Arc<Mutex<StatsSnapshot>>>,
+    mut stream: TcpStream,
+) {
     // Read until the end of headers (or a sane cap).
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -73,7 +80,11 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
     }
 
     // Strip query string and leading slash; validate the name.
-    let name = target.split('?').next().unwrap_or_default().trim_start_matches('/');
+    let name = target
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/');
 
     // M5: live stats routes.
     if name == "peers" {
@@ -84,7 +95,14 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
             } else {
                 format!("{body}\n")
             };
-            respond(&mut stream, 200, "OK", "text/plain", body.as_bytes(), head_only);
+            respond(
+                &mut stream,
+                200,
+                "OK",
+                "text/plain",
+                body.as_bytes(),
+                head_only,
+            );
             return;
         }
     }
@@ -96,7 +114,14 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
             } else {
                 format!("{body}\n")
             };
-            respond(&mut stream, 200, "OK", "application/json", body.as_bytes(), head_only);
+            respond(
+                &mut stream,
+                200,
+                "OK",
+                "application/json",
+                body.as_bytes(),
+                head_only,
+            );
             return;
         }
     }
@@ -125,7 +150,14 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
     }
 
     if !valid_filename(name) {
-        respond(&mut stream, 404, "Not Found", "text/plain", b"not found\n", head_only);
+        respond(
+            &mut stream,
+            404,
+            "Not Found",
+            "text/plain",
+            b"not found\n",
+            head_only,
+        );
         return;
     }
 
@@ -144,7 +176,14 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
         }
         Err(_) => {
             log::debug(&format!("http: GET /{name} -> 404"));
-            respond(&mut stream, 404, "Not Found", "text/plain", b"not found\n", head_only);
+            respond(
+                &mut stream,
+                404,
+                "Not Found",
+                "text/plain",
+                b"not found\n",
+                head_only,
+            );
         }
     }
 }
@@ -153,25 +192,44 @@ fn handle_connection(root: PathBuf, stats: Option<Arc<Mutex<StatsSnapshot>>>, mu
 /// EXT-X-MEDIA-SEQUENCE is advanced to the first kept segment so the
 /// playlist stays coherent; the master (which has everything) is unchanged.
 fn filter_playlist(root: &std::path::Path, data: &[u8]) -> Vec<u8> {
+    playback_playlist(root, data, 0).unwrap_or_else(|| data.to_vec())
+}
+
+/// Build a player-facing playlist from a synced manifest. Only local files
+/// are listed and `holdback_segments` newest available files are omitted, so
+/// a live player stays behind the replication edge. `None` means the peer has
+/// not accumulated enough complete segments to start playback yet.
+pub fn playback_playlist(
+    root: &std::path::Path,
+    data: &[u8],
+    holdback_segments: usize,
+) -> Option<Vec<u8>> {
     let text = String::from_utf8_lossy(data);
-    let mut seq: u64 = 0;
+    let mut seq = 0u64;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             seq = rest.trim().parse().unwrap_or(0);
         }
     }
-    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+
+    let mut header: Vec<&str> = Vec::new();
     let mut pending: Vec<&str> = Vec::new(); // # lines queued before a segment
-    let mut first_kept: Option<u64> = None;
+    let mut kept: Vec<(u64, Vec<&str>, &str)> = Vec::new();
     let mut saw_m3u = false;
+    let mut saw_segment_tag = false;
     for line in text.lines() {
         if line.starts_with('#') {
             if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
                 continue; // re-emitted after we know the first kept segment
             }
-            pending.push(line);
-            if line.starts_with("#EXTM3U") {
-                saw_m3u = true;
+            saw_m3u |= line.starts_with("#EXTM3U");
+            if line.starts_with("#EXTINF:") {
+                saw_segment_tag = true;
+            }
+            if saw_segment_tag {
+                pending.push(line);
+            } else {
+                header.push(line);
             }
             continue;
         }
@@ -180,28 +238,35 @@ fn filter_playlist(root: &std::path::Path, data: &[u8]) -> Vec<u8> {
             continue;
         }
         if root.join(name).is_file() {
-            if first_kept.is_none() {
-                first_kept = Some(seq);
-            }
-            for p in pending.drain(..) {
-                out.extend_from_slice(p.as_bytes());
-                out.push(b'\n');
-            }
-            out.extend_from_slice(name.as_bytes());
-            out.push(b'\n');
+            kept.push((seq, std::mem::take(&mut pending), name));
         } else {
             pending.clear(); // drop EXTINF etc. for missing segments
         }
         seq += 1;
     }
-    // Empty result (nothing available yet): serve the original so players
-    // at least see the edge and retry.
-    if !saw_m3u || out.is_empty() {
-        return data.to_vec();
+
+    let keep_count = kept.len().saturating_sub(holdback_segments);
+    if !saw_m3u || keep_count == 0 {
+        return None;
     }
+    let first_kept = kept[0].0;
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    for tag in header {
+        out.extend_from_slice(tag.as_bytes());
+        out.push(b'\n');
+    }
+    for (_, tags, name) in kept.into_iter().take(keep_count) {
+        for tag in tags {
+            out.extend_from_slice(tag.as_bytes());
+            out.push(b'\n');
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\n');
+    }
+
     // Insert the advanced MEDIA-SEQUENCE right after #EXTM3U/#EXT-X-VERSION.
-    let insert = format!("#EXT-X-MEDIA-SEQUENCE:{}\n", first_kept.unwrap_or(0));
-    let mut final_out: Vec<u8> = Vec::with_capacity(out.len() + 32);
+    let insert = format!("#EXT-X-MEDIA-SEQUENCE:{first_kept}\n");
+    let mut final_out: Vec<u8> = Vec::with_capacity(out.len() + insert.len());
     let text_out = String::from_utf8_lossy(&out);
     let mut inserted = false;
     for line in text_out.lines() {
@@ -215,7 +280,7 @@ fn filter_playlist(root: &std::path::Path, data: &[u8]) -> Vec<u8> {
     if !inserted {
         final_out.extend_from_slice(insert.as_bytes());
     }
-    final_out
+    Some(final_out)
 }
 
 fn mime_of(name: &str) -> &'static str {
@@ -319,5 +384,42 @@ seg_0102.ts\n";
             filter_playlist(&dir, playlist.as_bytes()),
             playlist.as_bytes()
         );
+    }
+
+    #[test]
+    fn playback_playlist_holds_back_the_local_edge() {
+        let dir = tmpdir("holdback");
+        for n in 100..=103 {
+            fs::write(dir.join(format!("seg_{n:04}.ts")), b"x").unwrap();
+        }
+        let playlist = "\
+#EXTM3U\n\
+#EXT-X-VERSION:3\n\
+#EXT-X-TARGETDURATION:2\n\
+#EXT-X-MEDIA-SEQUENCE:100\n\
+#EXTINF:2.0,\n\
+seg_0100.ts\n\
+#EXTINF:2.0,\n\
+seg_0101.ts\n\
+#EXTINF:2.0,\n\
+seg_0102.ts\n\
+#EXTINF:2.0,\n\
+seg_0103.ts\n";
+        let out = playback_playlist(&dir, playlist.as_bytes(), 2).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n"));
+        assert!(text.contains("#EXT-X-TARGETDURATION:2"));
+        assert!(text.contains("seg_0100.ts"));
+        assert!(text.contains("seg_0101.ts"));
+        assert!(!text.contains("seg_0102.ts"));
+        assert!(!text.contains("seg_0103.ts"));
+    }
+
+    #[test]
+    fn playback_playlist_waits_for_the_holdback_buffer() {
+        let dir = tmpdir("holdback_wait");
+        fs::write(dir.join("seg_0100.ts"), b"x").unwrap();
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:2.0,\nseg_0100.ts\n";
+        assert!(playback_playlist(&dir, playlist.as_bytes(), 1).is_none());
     }
 }

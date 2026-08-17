@@ -32,12 +32,16 @@ parallel from the master and any discovered peers, serves over HTTP):
 Terminal 3 — watch the stream (from the peer — it's replicated over UDP):
 
 ```
-ffplay http://127.0.0.1:8081/live.m3u8 -live_start_index 0
+ffplay http://127.0.0.1:8081/playback.m3u8 -live_start_index 0
 ```
 
 The peer logs `handshake OK`, then `manifest updated (N segments, M bytes)`
-as the live playlist rolls; its copy lands in `./data/live.m3u8` (use a
-custom dir: `qstream peer 4444 127.0.0.1 3333 /path/to/dir`). It then **pulls every missing segment** — several in parallel, from the master
+as the live playlist rolls; its raw synced manifest lands in `./data/live.m3u8`
+(use a custom dir: `qstream peer 4444 127.0.0.1 3333 /path/to/dir`). It also
+creates `./data/playback.m3u8` for local players: this lists only complete
+local segments and holds back three segments by default to absorb replication
+jitter. `live.m3u8` remains the manifest shared with other qstream peers. It
+then **pulls every missing segment** — several in parallel, from the master
 *and* any peers it discovers via peerlists (`pulling seg_X from <addr>`,
 `downloaded seg_XXXX.ts (N bytes, ...ms, ... KB/s)`).
 
@@ -47,6 +51,7 @@ custom dir: `qstream peer 4444 127.0.0.1 3333 /path/to/dir`). It then **pulls ev
 |--------------|------------------------------------------------|---------|
 | `QSTREAM_NAME` | node name sent in handshake                  | `master` / `peer` |
 | `QSTREAM_LOG`  | log level: `error` `warn` `info` `debug` `trace` | `info` |
+| `QSTREAM_PLAYBACK_HOLDBACK_SEGMENTS` | complete local segments withheld from `playback.m3u8` | `3` |
 
 ## Tests
 

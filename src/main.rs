@@ -35,6 +35,7 @@ Env:
     QSTREAM_QUIET_MS        receiver quiet period, ms (default 150; adaptive M5)
     QSTREAM_FIRST_TIMEOUT_MS  first-response timeout, ms (default 4000)
     QSTREAM_RETENTION_SECS  keep old segments this long for playback (default 0 = off)
+    QSTREAM_PLAYBACK_HOLDBACK_SEGMENTS  complete HLS segments held behind the peer edge (default 3)
 Fault injection (M5, per-node):
     QSTREAM_FAULT_DROP_PCT     %% of outgoing datagrams dropped
     QSTREAM_FAULT_DUP_PCT      %% sent twice
@@ -149,5 +150,6 @@ fn node_name(default: &str) -> String {
 }
 
 fn parse_port(s: &str) -> Result<u16, String> {
-    s.parse::<u16>().map_err(|_| format!("invalid http port: {s}"))
+    s.parse::<u16>()
+        .map_err(|_| format!("invalid http port: {s}"))
 }
