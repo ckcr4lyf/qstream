@@ -9,6 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub const MAGIC: [u8; 3] = *b"QST";
 pub const PROTOCOL_VERSION: u8 = 0x03;
 pub const HEADER_SIZE: usize = 14;
+/// Number of recent segment positions represented by an availability mask.
+pub const AVAILABILITY_MASK_BITS: u32 = 16;
 
 /// Peerlist entry flags (N1):
 pub const PEER_UPNP_MAPPED: u8 = 0x01; // claimed endpoint == observed (verified mapping)
@@ -72,6 +74,14 @@ impl AckType {
     }
 }
 
+/// Compact recent segment inventory. Bit 0 represents `newest`, bit 1
+/// `newest - 1`, through bit 15. Segment numbers map to `seg_<number>.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentAvailability {
+    pub newest: u64,
+    pub mask: u16,
+}
+
 /// A decoded message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -96,8 +106,12 @@ pub enum Message {
         total_packets: u16,
         data: Vec<u8>,
     },
-    /// SEGMENT_NOT_FOUND — no payload.
-    SegmentNotFound { transfer_id: u16 },
+    /// SEGMENT_NOT_FOUND — optionally carries the responder's compact recent
+    /// segment inventory. Empty payload remains compatible with older nodes.
+    SegmentNotFound {
+        transfer_id: u16,
+        availability: Option<SegmentAvailability>,
+    },
     /// ACK — for Progress, payload is (next_start, next_count); for
     /// Complete, payload is empty.
     Ack {
@@ -114,8 +128,9 @@ pub enum Message {
     /// LAN beacon when broadcast; a PONG proves the direct path works (N2).
     /// The nonce lets a node recognize (and ignore) its own broadcast echo.
     Ping { nonce: u32, name: String },
-    /// PONG — no payload.
-    Pong,
+    /// PONG — optionally carries the sender's compact recent segment
+    /// inventory. Empty payload remains compatible with older nodes.
+    Pong { availability: Option<SegmentAvailability> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +153,8 @@ pub enum ProtocolError {
     BadAckPayload { len: usize },
     /// Peerlist payload length must be a multiple of 7 bytes.
     BadPeerlistPayload { len: usize },
+    /// Availability payload must be empty or exactly 10 bytes.
+    BadAvailabilityPayload { len: usize },
 }
 
 impl fmt::Display for ProtocolError {
@@ -168,6 +185,9 @@ impl fmt::Display for ProtocolError {
             ProtocolError::BadPeerlistPayload { len } => {
                 write!(f, "peerlist payload must be a multiple of 7 bytes, got {len}")
             }
+            ProtocolError::BadAvailabilityPayload { len } => {
+                write!(f, "availability payload must be empty or 10 bytes, got {len}")
+            }
         }
     }
 }
@@ -197,7 +217,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
                 *packet_number,
                 *total_packets,
             ),
-            Message::SegmentNotFound { transfer_id } => {
+            Message::SegmentNotFound { transfer_id, .. } => {
                 (MessageType::SegmentNotFound, 0, *transfer_id, 0, 0)
             }
             Message::Ack {
@@ -208,7 +228,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             Message::PeerlistRequest => (MessageType::PeerlistRequest, 0, 0, 0, 0),
             Message::PeerlistResponse { .. } => (MessageType::PeerlistResponse, 0, 0, 0, 0),
             Message::Ping { .. } => (MessageType::Ping, 0, 0, 0, 0),
-            Message::Pong => (MessageType::Pong, 0, 0, 0, 0),
+            Message::Pong { .. } => (MessageType::Pong, 0, 0, 0, 0),
         };
 
     let payload: Vec<u8> = match message {
@@ -226,7 +246,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
         Message::ManifestResponse { data } => data.clone(),
         Message::SegmentRequest { filename, .. } => filename.as_bytes().to_vec(),
         Message::SegmentContents { data, .. } => data.clone(),
-        Message::SegmentNotFound { .. } => Vec::new(),
+        Message::SegmentNotFound { availability, .. } => encode_availability(*availability),
         Message::Ack {
             ack_type,
             next_start,
@@ -249,7 +269,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             p.extend_from_slice(name.as_bytes());
             p
         }
-        Message::Pong => Vec::new(),
+        Message::Pong { availability } => encode_availability(*availability),
     };
 
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
@@ -321,7 +341,10 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
             total_packets,
             data: payload.to_vec(),
         },
-        MessageType::SegmentNotFound => Message::SegmentNotFound { transfer_id },
+        MessageType::SegmentNotFound => Message::SegmentNotFound {
+            transfer_id,
+            availability: decode_availability(payload)?,
+        },
         MessageType::Ack => {
             let ack_type = AckType::from_u8(flags).ok_or(ProtocolError::BadAckFlags { got: flags })?;
             match ack_type {
@@ -361,8 +384,31 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
                 name: utf8_name(&payload[4..])?,
             }
         }
-        MessageType::Pong => Message::Pong,
+        MessageType::Pong => Message::Pong {
+            availability: decode_availability(payload)?,
+        },
     })
+}
+
+fn encode_availability(availability: Option<SegmentAvailability>) -> Vec<u8> {
+    let Some(availability) = availability else {
+        return Vec::new();
+    };
+    let mut payload = Vec::with_capacity(10);
+    payload.extend_from_slice(&availability.newest.to_be_bytes());
+    payload.extend_from_slice(&availability.mask.to_be_bytes());
+    payload
+}
+
+fn decode_availability(payload: &[u8]) -> Result<Option<SegmentAvailability>, ProtocolError> {
+    match payload.len() {
+        0 => Ok(None),
+        10 => Ok(Some(SegmentAvailability {
+            newest: u64::from_be_bytes(payload[..8].try_into().unwrap()),
+            mask: u16::from_be_bytes(payload[8..].try_into().unwrap()),
+        })),
+        len => Err(ProtocolError::BadAvailabilityPayload { len }),
+    }
 }
 
 /// Encode a SocketAddr as 6 bytes (ipv4 octets + big-endian port);
@@ -465,7 +511,14 @@ mod tests {
             name: "peer-1".to_string(),
         };
         assert_eq!(decode(&encode(&ping)).unwrap(), ping);
-        let pong = Message::Pong;
+        let legacy_pong = Message::Pong { availability: None };
+        assert_eq!(decode(&encode(&legacy_pong)).unwrap(), legacy_pong);
+        let pong = Message::Pong {
+            availability: Some(SegmentAvailability {
+                newest: 133_579,
+                mask: 0b1011,
+            }),
+        };
         assert_eq!(decode(&encode(&pong)).unwrap(), pong);
     }
 
@@ -499,8 +552,31 @@ mod tests {
 
     #[test]
     fn roundtrip_segment_not_found() {
-        let msg = Message::SegmentNotFound { transfer_id: 0xBEEF };
+        let legacy = Message::SegmentNotFound {
+            transfer_id: 0xBEEF,
+            availability: None,
+        };
+        assert_eq!(decode(&encode(&legacy)).unwrap(), legacy);
+        let msg = Message::SegmentNotFound {
+            transfer_id: 0xBEEF,
+            availability: Some(SegmentAvailability {
+                newest: 133_579,
+                mask: 0b1111,
+            }),
+        };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+
+    #[test]
+    fn rejects_invalid_availability_payload() {
+        let mut datagram = encode(&Message::Pong { availability: None });
+        datagram[6] = 0;
+        datagram[7] = 1;
+        datagram.push(0);
+        assert!(matches!(
+            decode(&datagram),
+            Err(ProtocolError::BadAvailabilityPayload { len: 1 })
+        ));
     }
 
     #[test]

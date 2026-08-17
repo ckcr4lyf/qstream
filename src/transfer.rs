@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::fault::FaultInjector;
 use crate::log;
-use crate::protocol::{self, AckType, Message};
+use crate::protocol::{self, AckType, Message, SegmentAvailability, AVAILABILITY_MASK_BITS};
 
 pub const SEGMENT_PACKET_SIZE: usize = 1400;
 pub const INITIAL_WINDOW: u16 = 5;
@@ -676,7 +676,10 @@ impl TransferRegistry {
         transfer_id: u16,
         src: SocketAddr,
     ) {
-        let msg = Message::SegmentNotFound { transfer_id };
+        let msg = Message::SegmentNotFound {
+            transfer_id,
+            availability: self.segment_availability(),
+        };
         fault.send(socket, protocol::encode(&msg), src, Instant::now());
     }
 
@@ -790,6 +793,24 @@ impl TransferRegistry {
         }
     }
 
+    /// Summarize locally stored recent segments in a compact 16-bit mask.
+    pub fn segment_availability(&self) -> Option<SegmentAvailability> {
+        let entries = fs::read_dir(&self.segment_root).ok()?;
+        let numbers: Vec<u64> = entries
+            .flatten()
+            .filter_map(|entry| segment_number(&entry.file_name().to_string_lossy()))
+            .collect();
+        let newest = *numbers.iter().max()?;
+        let mut mask = 0u16;
+        for number in numbers {
+            let distance = newest.saturating_sub(number);
+            if distance < AVAILABILITY_MASK_BITS as u64 {
+                mask |= 1 << distance;
+            }
+        }
+        Some(SegmentAvailability { newest, mask })
+    }
+
     pub fn on_not_found(&mut self, _socket: &UdpSocket, transfer_id: u16) {
         if let Some(r) = self.receivers.get_mut(&transfer_id) {
             let filename = r.filename.clone();
@@ -862,6 +883,10 @@ impl TransferRegistry {
             self.receivers.remove(&id);
         }
     }
+}
+
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
 }
 
 #[cfg(test)]

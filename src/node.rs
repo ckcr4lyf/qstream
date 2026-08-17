@@ -148,6 +148,9 @@ pub struct Node {
     claims: HashMap<SocketAddr, SocketAddr>,
     /// Ping/pong reachability per peer address (N2).
     paths: HashMap<SocketAddr, PathState>,
+    /// Recent segment inventories learned from upgraded peers. Inventories are
+    /// advisory and expire quickly because a live peer's store changes fast.
+    availability: HashMap<SocketAddr, (protocol::SegmentAvailability, Instant)>,
     local_addr: SocketAddr,
     next_ping: Instant,
     next_beacon: Instant,
@@ -199,6 +202,7 @@ impl Node {
             beacon_nonce,
             claims: HashMap::new(),
             paths: HashMap::new(),
+            availability: HashMap::new(),
             local_addr,
             next_ping: Instant::now() + PING_INTERVAL,
             next_beacon: Instant::now() + BEACON_INTERVAL,
@@ -231,6 +235,31 @@ impl Node {
     /// Is the direct path to `addr` fresh (PONG within PATH_FRESH)?
     pub fn path_fresh(&self, addr: SocketAddr, now: Instant) -> bool {
         self.paths.get(&addr).map(|p| p.fresh(now)).unwrap_or(false)
+    }
+
+    /// Record a peer's compact recent segment inventory.
+    pub fn record_availability(&mut self, peer: SocketAddr, availability: protocol::SegmentAvailability) {
+        self.availability.insert(peer, (availability, Instant::now()));
+    }
+
+    /// Return false only when a recent inventory explicitly says the peer
+    /// lacks `filename`; unknown or stale inventories remain eligible.
+    pub fn peer_may_have(&self, peer: SocketAddr, filename: &str, now: Instant) -> bool {
+        const AVAILABILITY_TTL: Duration = Duration::from_secs(15);
+        let Some(number) = segment_number(filename) else {
+            return true;
+        };
+        let Some((availability, observed_at)) = self.availability.get(&peer) else {
+            return true;
+        };
+        if now.duration_since(*observed_at) > AVAILABILITY_TTL || number > availability.newest {
+            return true;
+        }
+        let distance = availability.newest - number;
+        if distance >= protocol::AVAILABILITY_MASK_BITS as u64 {
+            return true;
+        }
+        availability.mask & (1 << distance) != 0
     }
 
     /// Resolve a peer address to the best address to reach it: if the same
@@ -797,6 +826,7 @@ impl Node {
                         self.peers.remove(&old);
                         self.paths.remove(&old);
                         self.claims.remove(&old);
+                        self.availability.remove(&old);
                         self.register_peer(src, name.clone());
                         if let Some(s) = stat {
                             self.peer_stats.insert(src, s);
@@ -816,13 +846,18 @@ impl Node {
                         }
                     }
                 }
-                let pong = Message::Pong;
+                let pong = Message::Pong {
+                    availability: self.registry.segment_availability(),
+                };
                 self.send(&protocol::encode(&pong), src);
                 Event::None
             }
-            Message::Pong => {
+            Message::Pong { availability } => {
                 log::trace(&format!("pong from {src} — direct path fresh"));
                 self.record_pong(src, Instant::now());
+                if let Some(availability) = availability {
+                    self.record_availability(src, availability);
+                }
                 Event::None
             }
             Message::ManifestRequest => {
@@ -896,7 +931,13 @@ impl Node {
                 );
                 Event::None
             }
-            Message::SegmentNotFound { transfer_id } => {
+            Message::SegmentNotFound {
+                transfer_id,
+                availability,
+            } => {
+                if let Some(availability) = availability {
+                    self.record_availability(src, availability);
+                }
                 self.registry.on_not_found(&self.socket, transfer_id);
                 Event::None
             }
@@ -953,6 +994,10 @@ fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
 /// Is `addr` a globally reachable endpoint (not loopback, not RFC1918)?
 /// Loopback/private peers of the master are meaningless to a remote peer;
 /// they must not be advertised (or handshaken) across the internet.
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
+}
+
 pub fn remote_public(addr: SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_private(),

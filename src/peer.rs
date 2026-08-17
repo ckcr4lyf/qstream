@@ -43,6 +43,9 @@ const MAX_INFLIGHT_PER_PEER: usize = 2;
 /// Unresponsive pulls before a peer is evicted (M5: one timeout can just
 /// be a bad moment; three is a pattern).
 const EVICT_AFTER_UNRESPONSIVE: u32 = 3;
+/// The master is authoritative for the live edge. Do not spend a peer trial
+/// on these newest manifest entries; lagging peers are useful behind them.
+const MASTER_EDGE_SEGMENTS: u64 = 3;
 /// Keep this many complete segments beyond the player-facing edge. With the
 /// default 2-second HLS segments, three entries give playback about 6 seconds
 /// to absorb replication jitter without delaying swarm synchronization.
@@ -496,13 +499,18 @@ fn pick_peer(
     let tried_for = tried.get(filename);
     let inflight = |p: &SocketAddr| active.values().filter(|j| &j.peer == p).count();
     // Candidates are resolved to their best reachable address (LAN path
-    // preferred, N3) and weighted by path freshness (N2).
+    // preferred, N3) and weighted by path freshness (N2). The master owns
+    // the freshest playlist entries, while a peer's recent availability mask
+    // rules it out only when it explicitly lacks this segment.
     let now = Instant::now();
+    let master_only = master_owns_segment(node, filename);
     let candidates: Vec<SocketAddr> = node
         .peers
         .keys()
         .map(|p| node.effective_addr(*p))
         .filter(|p| *p != local_addr)
+        .filter(|p| !master_only || *p == bootstrap)
+        .filter(|p| node.peer_may_have(*p, filename, now))
         .filter(|p| tried_for.map(|s| !s.contains(p)).unwrap_or(true))
         .filter(|p| inflight(p) < MAX_INFLIGHT_PER_PEER)
         .collect();
@@ -535,6 +543,24 @@ fn pick_peer(
 }
 
 /// Atomically write the manifest; returns true if the content changed.
+fn master_owns_segment(node: &Node, filename: &str) -> bool {
+    let Some(requested) = segment_number(filename) else {
+        return false;
+    };
+    let manifest = fs::read(&node.manifest_path).unwrap_or_default();
+    let Some(latest) = transfer::parse_manifest(&manifest)
+        .last()
+        .and_then(|name| segment_number(name))
+    else {
+        return false;
+    };
+    is_master_edge(latest, requested)
+}
+
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
+}
+
 fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
     let real = data_dir.join("live.m3u8");
     let tmp = data_dir.join("live.m3u8.tmp");
@@ -576,6 +602,23 @@ fn refresh_playback_manifest(data_dir: &Path, holdback_segments: usize) -> io::R
 
 /// Enqueue manifest segments that are missing locally and not already
 /// queued/in-flight and not in the failure cooldown.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn master_owns_three_newest_segments() {
+        assert!(is_master_edge(100, 100));
+        assert!(is_master_edge(100, 99));
+        assert!(is_master_edge(100, 98));
+        assert!(!is_master_edge(100, 97));
+    }
+}
+
+fn is_master_edge(latest: u64, requested: u64) -> bool {
+    latest.saturating_sub(requested) < MASTER_EDGE_SEGMENTS
+}
+
 fn sync_queue(
     data_dir: &Path,
     manifest: &[u8],
