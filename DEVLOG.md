@@ -304,3 +304,9 @@ A five-second parent wait is also applied for known assigned parents. If none
 has a fresh positive inventory for a queued segment, the peer waits briefly
 for parent replication before using the master recovery path. This is bounded
 so a stalled parent cannot hold playback indefinitely.
+
+The first live run also exposed a peer identity bug: two independent peers
+using the default display name `peer` were re-keyed over each other when their
+PINGs arrived. Peer names are not identities, so public socket endpoints are
+now kept independently. This is required for stable parent assignments and
+inventory tracking when users leave the default name unchanged.

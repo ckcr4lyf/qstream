@@ -1039,42 +1039,22 @@ impl Node {
                 let known = self.peers.contains_key(&src);
                 if !known && !name.is_empty() {
                     // First contact via PING: a LAN beacon or a punch probe.
-                    // If we already know this NAME at a different address,
-                    // re-key to the address that just reached us (N2 punch:
-                    // the per-destination NAT mapping differs from the
-                    // master-observed one). LAN entries are kept alongside.
-                    let existing: Option<SocketAddr> = self
-                        .peers
-                        .iter()
-                        .find(|(a, i)| i.name == name && **a != src && !self.is_lan_path(**a))
-                        .map(|(a, _)| *a);
-                    if let Some(old) = existing {
-                        log::info(&format!(
-                            "peer {name} reached via new address {src} (was {old}) — re-keying"
-                        ));
-                        let stat = self.peer_stats.remove(&old);
-                        self.peers.remove(&old);
-                        self.paths.remove(&old);
-                        self.claims.remove(&old);
-                        self.availability.remove(&old);
-                        self.register_peer(src, name.clone());
-                        if let Some(s) = stat {
-                            self.peer_stats.insert(src, s);
-                        }
-                    } else {
-                        let display = name.clone();
-                        log::info(&format!("discovered peer {display} at {src} (ping)"));
-                        self.register_peer(src, display);
-                        // A first PING from a private or loopback source is
-                        // a LAN beacon. Public PINGs are punch probes and
-                        // must not be mislabeled as LAN paths in /peers.
-                        let is_lan_source = match src.ip() {
-                            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
-                            IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local(),
-                        };
-                        if is_lan_source {
-                            self.paths.get_mut(&src).map(|p| p.lan = true);
-                        }
+                    // Names are display labels, not stable identities: many
+                    // peers legitimately use the default name "peer". Keep
+                    // simultaneous public endpoints instead of re-keying one
+                    // over another based on a colliding name.
+                    let display = name.clone();
+                    log::info(&format!("discovered peer {display} at {src} (ping)"));
+                    self.register_peer(src, display);
+                    // A first PING from a private or loopback source is a LAN
+                    // beacon. Public PINGs are punch probes and must not be
+                    // mislabeled as LAN paths in /peers.
+                    let is_lan_source = match src.ip() {
+                        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+                        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local(),
+                    };
+                    if is_lan_source {
+                        self.paths.get_mut(&src).map(|p| p.lan = true);
                     }
                 }
                 let pong = Message::Pong {
