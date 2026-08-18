@@ -238,7 +238,9 @@ pub fn run(
                             // beacon (broadcast PING) will find it directly;
                             // handshaking the public endpoint would hit the
                             // NAT's hairpin behavior (N3).
-                            if flags & PEER_SAME_IP != 0 {
+                            if flags & PEER_SAME_IP != 0
+                                && node.my_public.map(crate::node::remote_public) == Some(true)
+                            {
                                 continue;
                             }
                             if flags & PEER_PARENT != 0 {
@@ -292,7 +294,8 @@ pub fn run(
         // Discovered peers that didn't answer: drop, retried on next list.
         pending_handshakes.retain(|peer, deadline| {
             if now >= *deadline {
-                log::warn(&format!("no handshake reply from {peer} — skipping"));
+                log::warn(&format!("no handshake reply from {peer} — removing stale source"));
+                node.peers.remove(peer);
                 false
             } else {
                 true
@@ -565,7 +568,11 @@ fn pick_peer(
         .keys()
         .map(|p| node.effective_addr(*p))
         .filter(|p| *p != local_addr)
-        .filter(|p| node.peer_may_have(*p, filename, now))
+        // The bootstrap manifest is authoritative for its own segments;
+        // compact inventory is advisory and may lag by one poll. Keep the
+        // master eligible as the recovery source even when its bitmap is
+        // stale or negative.
+        .filter(|p| *p == bootstrap || node.peer_may_have(*p, filename, now))
         .filter(|p| {
             let cooling = retry_after
                 .get(&(filename.to_string(), *p))
@@ -586,7 +593,9 @@ fn pick_peer(
         candidates = parent_sources;
     } else {
         let has_known_parent = parents.iter().any(|parent| {
-            *parent != local_addr && node.peers.contains_key(parent)
+            *parent != local_addr
+                && node.peers.contains_key(parent)
+                && node.path_fresh(*parent, now)
         });
         if has_known_parent {
             let since = parent_wait.entry(filename.to_string()).or_insert(now);
@@ -599,6 +608,22 @@ fn pick_peer(
         node.peer_availability(peer, filename, now)
     });
     if candidates.is_empty() {
+        // A peer may have been tried just before its inventory or path went
+        // stale. The bootstrap manifest is authoritative, so preserve one
+        // recovery path instead of leaving the queue idle indefinitely.
+        let cooling = retry_after
+            .get(&(filename.to_string(), bootstrap))
+            .map(|until| now < *until)
+            .unwrap_or(false);
+        if is_bootstrap_recovery_candidate(
+            node.peers.contains_key(&bootstrap),
+            cooling,
+            inflight(&bootstrap) >= MAX_INFLIGHT_PER_PEER,
+            tried_for.map(|s| !s.contains(&bootstrap)).unwrap_or(true),
+            true,
+        ) {
+            return Some(bootstrap);
+        }
         return None;
     }
     let weight = |p: &SocketAddr| -> f64 {
@@ -663,6 +688,20 @@ where
     } else {
         candidates
     }
+}
+
+fn is_bootstrap_recovery_candidate(
+    bootstrap_known: bool,
+    cooling: bool,
+    inflight_limit_reached: bool,
+    not_tried: bool,
+    manifest_authoritative: bool,
+) -> bool {
+    bootstrap_known
+        && !cooling
+        && !inflight_limit_reached
+        && not_tried
+        && manifest_authoritative
 }
 
 fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
@@ -738,6 +777,12 @@ mod tests {
             (addr == master).then_some(true)
         });
         assert_eq!(selected, vec![master]);
+    }
+
+    #[test]
+    fn bootstrap_manifest_remains_recovery_source_when_inventory_lags() {
+        assert!(is_bootstrap_recovery_candidate(true, false, false, true, true));
+        assert!(!is_bootstrap_recovery_candidate(true, true, false, true, true));
     }
 
     #[test]

@@ -300,6 +300,7 @@ impl Node {
             .flat_map(|seeders| seeders.iter().copied())
             .filter(|candidate| {
                 self.peers.contains_key(candidate)
+                    && self.path_fresh(*candidate, now)
                     && self.peer_availability(*candidate, filename, now) != Some(false)
             })
             .collect();
@@ -312,7 +313,7 @@ impl Node {
         let reachable_seeders: HashSet<SocketAddr> = seeders
             .iter()
             .copied()
-            .filter(|candidate| !requester_is_remote || remote_public(*candidate))
+            .filter(|candidate| remote_public(*candidate) == requester_is_remote)
             .collect();
         if seed_lease_allowed(&reachable_seeders, peer, limit) {
             if !seeders.contains(&peer) {
@@ -336,7 +337,8 @@ impl Node {
         let now = Instant::now();
         let peer_source_exists = self.peers.keys().any(|candidate| {
             *candidate != peer
-                && (!requester_is_remote || remote_public(*candidate))
+                && remote_public(*candidate) == requester_is_remote
+                && self.path_fresh(*candidate, now)
                 && self.peer_availability(*candidate, filename, now) == Some(true)
         });
         if !peer_source_exists {
