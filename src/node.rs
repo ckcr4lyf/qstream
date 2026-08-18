@@ -66,12 +66,14 @@ pub enum ServeResult {
 pub struct PeerStat {
     pub name: String,
     pub pulls: u32,
+    pub downloaded_bytes: u64,
     pub nf_pulls: u32,
     pub timeouts: u32,
     pub other_fails: u32,
     pub served: u32,
     pub nf_served: u32,
     pub sender_fails: u32,
+    pub uploaded_bytes: u64,
     pub latency_ms: u32, // EWMA of first-packet latency
     pub score: u32,
     pub last_seen: Instant,
@@ -82,12 +84,14 @@ impl PeerStat {
         PeerStat {
             name,
             pulls: 0,
+            downloaded_bytes: 0,
             nf_pulls: 0,
             timeouts: 0,
             other_fails: 0,
             served: 0,
             nf_served: 0,
             sender_fails: 0,
+            uploaded_bytes: 0,
             latency_ms: 0,
             score: 50,
             last_seen: Instant::now(),
@@ -414,6 +418,7 @@ impl Node {
                         stat.latency_ms = (stat.latency_ms * 3 + ms as u32) / 4;
                     }
                 }
+                stat.downloaded_bytes += bytes;
                 self.downloaded_total += 1;
                 self.downloaded_bytes += bytes;
             }
@@ -449,6 +454,7 @@ impl Node {
             ServeResult::Served => {
                 stat.served += 1;
                 stat.adjust(2);
+                stat.uploaded_bytes += bytes;
                 self.served_total += 1;
                 self.served_bytes += bytes;
             }
@@ -680,9 +686,9 @@ impl Node {
                 })
                 .unwrap_or_default();
             lines.push(format!(
-                "peer {} {} score={} pulls={} nf_pulls={} timeouts={} other_fails={} served={} nf_served={} sender_fails={} latency={}ms path={}{}",
-                s.name, addr, s.score, s.pulls, s.nf_pulls, s.timeouts, s.other_fails,
-                s.served, s.nf_served, s.sender_fails, s.latency_ms, path, inventory
+                "peer {} {} score={} pulls={} downloaded_bytes={} nf_pulls={} timeouts={} other_fails={} served={} uploaded_bytes={} nf_served={} sender_fails={} latency={}ms path={}{}",
+                s.name, addr, s.score, s.pulls, s.downloaded_bytes, s.nf_pulls, s.timeouts, s.other_fails,
+                s.served, s.uploaded_bytes, s.nf_served, s.sender_fails, s.latency_ms, path, inventory
             ));
         }
         if self.fault.enabled() {
@@ -704,14 +710,16 @@ impl Node {
             .iter()
             .map(|(addr, s)| {
                 format!(
-                    "{{\"name\":\"{}\",\"addr\":\"{}\",\"score\":{},\"pulls\":{},\"nf_pulls\":{},\"timeouts\":{},\"served\":{},\"nf_served\":{},\"latency_ms\":{}}}",
+                    "{{\"name\":\"{}\",\"addr\":\"{}\",\"score\":{},\"pulls\":{},\"downloaded_bytes\":{},\"nf_pulls\":{},\"timeouts\":{},\"served\":{},\"uploaded_bytes\":{},\"nf_served\":{},\"latency_ms\":{}}}",
                     json_escape(&s.name),
                     addr,
                     s.score,
                     s.pulls,
+                    s.downloaded_bytes,
                     s.nf_pulls,
                     s.timeouts,
                     s.served,
+                    s.uploaded_bytes,
                     s.nf_served,
                     s.latency_ms
                 )
@@ -853,6 +861,11 @@ impl Node {
                 "counter",
             ),
             (
+                "qstream_peer_downloaded_bytes_total",
+                "Payload bytes downloaded from a peer.",
+                "counter",
+            ),
+            (
                 "qstream_peer_nf_pulls_total",
                 "NOT_FOUND responses from a peer.",
                 "counter",
@@ -865,6 +878,11 @@ impl Node {
             (
                 "qstream_peer_served_total",
                 "Segments served to a peer.",
+                "counter",
+            ),
+            (
+                "qstream_peer_uploaded_bytes_total",
+                "Payload bytes uploaded to a peer.",
                 "counter",
             ),
             (
@@ -925,9 +943,19 @@ impl Node {
             );
             s("qstream_peer_score", &pl, stat.score as u64);
             s("qstream_peer_pulls_total", &pl, stat.pulls as u64);
+            s(
+                "qstream_peer_downloaded_bytes_total",
+                &pl,
+                stat.downloaded_bytes,
+            );
             s("qstream_peer_nf_pulls_total", &pl, stat.nf_pulls as u64);
             s("qstream_peer_timeouts_total", &pl, stat.timeouts as u64);
             s("qstream_peer_served_total", &pl, stat.served as u64);
+            s(
+                "qstream_peer_uploaded_bytes_total",
+                &pl,
+                stat.uploaded_bytes,
+            );
             s("qstream_peer_latency_ms", &pl, stat.latency_ms as u64);
         }
         out
@@ -1192,6 +1220,15 @@ mod tests {
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
         assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn peer_stats_keep_directional_payload_bytes() {
+        let mut stat = PeerStat::new("peer".to_string());
+        stat.downloaded_bytes += 1234;
+        stat.uploaded_bytes += 5678;
+        assert_eq!(stat.downloaded_bytes, 1234);
+        assert_eq!(stat.uploaded_bytes, 5678);
     }
 }
 

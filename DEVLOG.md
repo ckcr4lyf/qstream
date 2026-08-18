@@ -278,3 +278,13 @@ live window while preserving origin recovery.
 Retention pruning now immediately announces a fresh inventory when files are
 removed. This closes the stale-positive window without increasing the normal
 announcement cadence.
+
+## Per-peer transfer accounting (2026-08-18)
+
+`PeerStat` now tracks directional payload bytes in addition to segment counts:
+`downloaded_bytes` is completed payload received from that peer, and
+`uploaded_bytes` is completed payload sent to that peer. Upload bytes are
+recorded only after `ACK_COMPLETE`, so failed or abandoned sends are excluded.
+The fields are exposed in `/peers`, `/stats`, and Prometheus metrics as
+`qstream_peer_downloaded_bytes_total` and
+`qstream_peer_uploaded_bytes_total`.

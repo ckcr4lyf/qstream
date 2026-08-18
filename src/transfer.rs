@@ -151,6 +151,10 @@ impl SenderTransfer {
         }
     }
 
+    pub fn payload_bytes(&self) -> u64 {
+        self.file.len() as u64
+    }
+
     pub fn deadline(&self) -> Instant {
         if self.range_sent >= self.range.1 {
             // Window fully sent — next event is the ack timer.
@@ -715,13 +719,11 @@ impl TransferRegistry {
         let filepath = self.segment_root.join(filename);
         match fs::read(&filepath) {
             Ok(file) => {
-                let bytes = file.len() as u64;
                 let sender = SenderTransfer::new(transfer_id, src, file);
                 log::info(&format!(
                     "serving {filename} to {src} (transfer {transfer_id:#06x}, {} packets)",
                     sender.total_packets
                 ));
-                self.events.push(RegEvent::Served { src, bytes });
                 self.senders.insert(transfer_id, sender);
             }
             Err(_) => {
@@ -789,9 +791,15 @@ impl TransferRegistry {
     ) {
         if let Some(sender) = self.senders.get_mut(&transfer_id) {
             if sender.on_ack(ack_type, next_start, next_count) {
+                let bytes = sender.payload_bytes();
+                let remote = sender.remote;
                 log::info(&format!(
                     "transfer {transfer_id:#06x} complete — sender freed"
                 ));
+                self.events.push(RegEvent::Served {
+                    src: remote,
+                    bytes,
+                });
                 self.senders.remove(&transfer_id);
             }
         } else {
