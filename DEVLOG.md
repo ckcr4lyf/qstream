@@ -329,6 +329,25 @@ without recording a definitive missing segment or incrementing ordinary
 `NOT_FOUND` churn counters. Genuine file absence remains an unflagged
 `SEGMENT_NOT_FOUND`.
 
+## Restart recovery regression (2026-08-18)
+
+A live restart exposed two recovery bugs in the staged seeding scheduler.
+Temporary origin denials left a source permanently in the per-segment
+`tried` set, so a segment could be requeued forever with no eligible source.
+Additionally, the master counted unreachable loopback lab peers against the
+origin budget for remote requesters. `03dba31` adds a five-second per-source
+retry cooldown and counts only requester-reachable seeders for remote peers.
+
+A second restart case showed that old queued filenames could outlive the
+moving ten-segment manifest. `c4c2d89` reconciles the queue and queued-set to
+the current manifest before adding new work, preventing stale segments from
+blocking current live-edge pulls.
+
+Verification after deploying `c4c2d89`: VPS-2 reached the live edge with
+`catch_up=0`, `queue_depth=0`, 216 completed downloads, and playback HTTP 200.
+The restarted local five-peer lab reached the current edge within 15 seconds;
+its peers had 0-5 segments queued and no definitive `NOT_FOUND` pulls.
+
 **Final staged verification:** after deploying `fe04eb8`, VPS-2 completed 23
 pulls in a 57-second interval: 17 from `183.178.210.60:4447`, 6 from
 `121.202.204.206:4447`, and 0 from the master. It recorded 0 definitive
