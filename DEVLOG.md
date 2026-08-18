@@ -237,3 +237,25 @@ In a second cross-VPS run, VPS-2 saw the master's live inventory
 and served `playback.m3u8` with HTTP 200. The legacy home peer exposes no
 inventory, as expected; it remains compatible but is not selected for the
 three-segment live edge.
+
+## Origin load correction (2026-08-17) — SUPERSEDES EDGE RULE
+
+The fixed master-only rule for the newest three segments was not scalable: it
+made every peer fetch at least those three pieces from the origin, even when
+another peer already had them. With 10,000 peers this creates 30,000 origin
+segment transfers per rolling edge window.
+
+The scheduler now uses availability-first selection for every manifest entry:
+
+- a non-master peer with a fresh inventory bit confirming the requested piece
+  is selected without competing with the master;
+- the master remains an authoritative fallback when no non-master peer can
+  prove possession;
+- unknown inventories remain eligible as low-confidence fallback candidates;
+- fresh inventories explicitly denying a piece are still filtered out.
+
+This preserves recovery when the swarm has no known copy while allowing the
+swarm to fan out new segments from peers instead of forcing all live-edge
+traffic through the master. A future 10,000-peer deployment still needs
+bounded peer discovery and neighbor fanout; source selection alone does not
+make a full-mesh peer list scalable.

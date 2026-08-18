@@ -43,9 +43,6 @@ const MAX_INFLIGHT_PER_PEER: usize = 2;
 /// Unresponsive pulls before a peer is evicted (M5: one timeout can just
 /// be a bad moment; three is a pattern).
 const EVICT_AFTER_UNRESPONSIVE: u32 = 3;
-/// The master is authoritative for the live edge. Do not spend a peer trial
-/// on these newest manifest entries; lagging peers are useful behind them.
-const MASTER_EDGE_SEGMENTS: u64 = 3;
 /// Keep this many complete segments beyond the player-facing edge. With the
 /// default 2-second HLS segments, three entries give playback about 6 seconds
 /// to absorb replication jitter without delaying swarm synchronization.
@@ -500,21 +497,21 @@ fn pick_peer(
     let tried_for = tried.get(filename);
     let inflight = |p: &SocketAddr| active.values().filter(|j| &j.peer == p).count();
     // Candidates are resolved to their best reachable address (LAN path
-    // preferred, N3) and weighted by path freshness (N2). The master owns
-    // the freshest playlist entries, while a peer's recent availability mask
-    // rules it out only when it explicitly lacks this segment.
+    // preferred, N3). Fresh positive inventory is preferred for every
+    // segment, including the live edge; the master remains the fallback.
     let now = Instant::now();
-    let master_only = master_owns_segment(node, filename);
-    let candidates: Vec<SocketAddr> = node
+    let mut candidates: Vec<SocketAddr> = node
         .peers
         .keys()
         .map(|p| node.effective_addr(*p))
         .filter(|p| *p != local_addr)
-        .filter(|p| !master_only || *p == bootstrap)
         .filter(|p| node.peer_may_have(*p, filename, now))
         .filter(|p| tried_for.map(|s| !s.contains(p)).unwrap_or(true))
         .filter(|p| inflight(p) < MAX_INFLIGHT_PER_PEER)
         .collect();
+    candidates = prefer_advertised_peers(candidates, bootstrap, |peer| {
+        node.peer_availability(peer, filename, now)
+    });
     if candidates.is_empty() {
         return None;
     }
@@ -526,9 +523,14 @@ fn pick_peer(
             .map(|s| s.score as f64)
             .unwrap_or(50.0);
         let fresh = if node.path_fresh(*p, now) { 1.25 } else { 0.7 };
-        let mut w = (score + 1.0) / (inflight + 1.0) * fresh;
+        let availability = match node.peer_availability(*p, filename, now) {
+            Some(true) => 3.0,
+            Some(false) => 0.0,
+            None => 0.35,
+        };
+        let mut w = (score + 1.0) / (inflight + 1.0) * fresh * availability;
         if *p == bootstrap {
-            w *= 0.85; // slight bias toward peers sharing the load
+            w *= 0.9; // retain the swarm's origin fallback role
         }
         w.max(0.001)
     };
@@ -543,23 +545,28 @@ fn pick_peer(
     None
 }
 
-/// Atomically write the manifest; returns true if the content changed.
-fn master_owns_segment(node: &Node, filename: &str) -> bool {
-    let Some(requested) = segment_number(filename) else {
-        return false;
-    };
-    let manifest = fs::read(&node.manifest_path).unwrap_or_default();
-    let Some(latest) = transfer::parse_manifest(&manifest)
-        .last()
-        .and_then(|name| segment_number(name))
-    else {
-        return false;
-    };
-    is_master_edge(latest, requested)
-}
-
-fn segment_number(name: &str) -> Option<u64> {
-    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
+fn prefer_advertised_peers<F>(
+    candidates: Vec<SocketAddr>,
+    bootstrap: SocketAddr,
+    availability: F,
+) -> Vec<SocketAddr>
+where
+    F: Fn(SocketAddr) -> Option<bool>,
+{
+    let peer_sources: Vec<SocketAddr> = candidates
+        .iter()
+        .copied()
+        .filter(|p| *p != bootstrap)
+        .filter(|p| availability(*p) == Some(true))
+        .collect();
+    if peer_sources.is_empty() {
+        candidates
+    } else {
+        // Once any non-origin peer proves it has the piece, keep the origin
+        // out of this request entirely. The master is a fallback, not a
+        // competing source for every replicated segment.
+        peer_sources
+    }
 }
 
 fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
@@ -608,16 +615,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn master_owns_three_newest_segments() {
-        assert!(is_master_edge(100, 100));
-        assert!(is_master_edge(100, 99));
-        assert!(is_master_edge(100, 98));
-        assert!(!is_master_edge(100, 97));
+    fn advertised_peer_replaces_master_as_source() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let candidates = vec![master, peer];
+        let selected = prefer_advertised_peers(candidates, master, |addr| {
+            (addr == peer).then_some(true)
+        });
+        assert_eq!(selected, vec![peer]);
     }
-}
 
-fn is_master_edge(latest: u64, requested: u64) -> bool {
-    latest.saturating_sub(requested) < MASTER_EDGE_SEGMENTS
+    #[test]
+    fn master_remains_fallback_without_advertised_peer() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let candidates = vec![master, peer];
+        let selected = prefer_advertised_peers(candidates.clone(), master, |_| None);
+        assert_eq!(selected, candidates);
+    }
 }
 
 fn sync_queue(

@@ -262,20 +262,28 @@ impl Node {
         }
     }
 
+    /// Return a fresh inventory answer for `filename` when one is known.
+    /// `None` means the peer has no usable answer, so callers should retain
+    /// it as a fallback candidate rather than treating it as absent.
+    pub fn peer_availability(
+        &self,
+        peer: SocketAddr,
+        filename: &str,
+        now: Instant,
+    ) -> Option<bool> {
+        const AVAILABILITY_TTL: Duration = Duration::from_secs(15);
+        let number = segment_number(filename)?;
+        let (availability, observed_at) = self.availability.get(&peer)?;
+        if now.duration_since(*observed_at) > AVAILABILITY_TTL {
+            return None;
+        }
+        availability.contains(number)
+    }
+
     /// Return false only when a recent inventory explicitly says the peer
     /// lacks `filename`; unknown or stale inventories remain eligible.
     pub fn peer_may_have(&self, peer: SocketAddr, filename: &str, now: Instant) -> bool {
-        const AVAILABILITY_TTL: Duration = Duration::from_secs(15);
-        let Some(number) = segment_number(filename) else {
-            return true;
-        };
-        let Some((availability, observed_at)) = self.availability.get(&peer) else {
-            return true;
-        };
-        if now.duration_since(*observed_at) > AVAILABILITY_TTL {
-            return true;
-        }
-        availability.contains(number).unwrap_or(true)
+        self.peer_availability(peer, filename, now) != Some(false)
     }
 
     /// Resolve a peer address to the best address to reach it: if the same
