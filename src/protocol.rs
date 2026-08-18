@@ -16,6 +16,7 @@ pub const AVAILABILITY_MASK_BITS: u32 = 16;
 pub const PEER_UPNP_MAPPED: u8 = 0x01; // claimed endpoint == observed (verified mapping)
 pub const PEER_SAME_IP: u8 = 0x02; // same public IP as the requester (likely same NAT)
 pub const PEER_PARENT: u8 = 0x04; // assigned preferred source by the master
+pub const SEGMENT_NOT_READY: u8 = 0x01; // temporary source admission limit
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +128,7 @@ pub enum Message {
     SegmentNotFound {
         transfer_id: u16,
         availability: Option<SegmentAvailability>,
+        retryable: bool,
     },
     /// ACK — for Progress, payload is (next_start, next_count); for
     /// Complete, payload is empty.
@@ -249,9 +251,17 @@ pub fn encode(message: &Message) -> Vec<u8> {
             *packet_number,
             *total_packets,
         ),
-        Message::SegmentNotFound { transfer_id, .. } => {
-            (MessageType::SegmentNotFound, 0, *transfer_id, 0, 0)
-        }
+        Message::SegmentNotFound {
+            transfer_id,
+            retryable,
+            ..
+        } => (
+            MessageType::SegmentNotFound,
+            if *retryable { SEGMENT_NOT_READY } else { 0 },
+            *transfer_id,
+            0,
+            0,
+        ),
         Message::Ack {
             transfer_id,
             ack_type,
@@ -378,6 +388,7 @@ pub fn decode(datagram: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::SegmentNotFound => Message::SegmentNotFound {
             transfer_id,
             availability: decode_availability(payload)?,
+            retryable: flags & SEGMENT_NOT_READY != 0,
         },
         MessageType::Ack => {
             let ack_type =
@@ -590,6 +601,7 @@ mod tests {
         let legacy = Message::SegmentNotFound {
             transfer_id: 0xBEEF,
             availability: None,
+            retryable: false,
         };
         assert_eq!(decode(&encode(&legacy)).unwrap(), legacy);
         let msg = Message::SegmentNotFound {
@@ -598,8 +610,11 @@ mod tests {
                 newest: 133_579,
                 mask: 0b1111,
             }),
+            retryable: true,
         };
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+        let datagram = encode(&msg);
+        assert_eq!(datagram[5], SEGMENT_NOT_READY);
     }
 
     #[test]

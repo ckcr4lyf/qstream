@@ -48,6 +48,7 @@ pub struct PeerInfo {
 pub enum PullResult {
     Ok,
     NotFound,
+    RetryableNotFound,
     Timeout,
     Other,
 }
@@ -504,10 +505,13 @@ impl Node {
                 self.downloaded_bytes += bytes;
             }
             PullResult::NotFound => {
-                // "Doesn't have it yet" is availability churn (everyone asks
-                // everyone for the newest segment), not bad service — count
-                // it but don't punish the score (M5).
+                // A definitive absence is availability churn, not bad
+                // service. Keep it visible without punishing the score.
                 stat.nf_pulls += 1;
+            }
+            PullResult::RetryableNotFound => {
+                // Temporary origin admission denial is not evidence that a
+                // peer lacks the segment and should not pollute NF counts.
             }
             PullResult::Timeout => {
                 stat.timeouts += 1;
@@ -1265,6 +1269,7 @@ impl Node {
                         &mut self.fault,
                         transfer_id,
                         src,
+                        true,
                     );
                 }
                 Event::None
@@ -1289,12 +1294,17 @@ impl Node {
             Message::SegmentNotFound {
                 transfer_id,
                 availability,
+                retryable,
             } => {
                 if let Some(availability) = availability {
                     self.record_availability(src, availability);
                 }
-                if let Some(filename) = self.registry.on_not_found(&self.socket, transfer_id) {
-                    self.record_missing(src, &filename);
+                if let Some((filename, retryable)) =
+                    self.registry.on_not_found(&self.socket, transfer_id, retryable)
+                {
+                    if !retryable {
+                        self.record_missing(src, &filename);
+                    }
                 }
                 Event::None
             }

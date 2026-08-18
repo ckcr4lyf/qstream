@@ -322,3 +322,9 @@ apply the budget to segments it does not have. Assignment and denial counters
 are exposed in `/metrics`. A safety check prevents denial when no other known
 peer has a fresh positive inventory for the segment; in that case the master
 admits a replacement recovery seed even if the nominal budget is full.
+
+Seed-budget denials use the additive `SEGMENT_NOT_READY` flag on
+`SEGMENT_NOT_FOUND`. Requesters requeue these temporary admission responses
+without recording a definitive missing segment or incrementing ordinary
+`NOT_FOUND` churn counters. Genuine file absence remains an unflagged
+`SEGMENT_NOT_FOUND`.

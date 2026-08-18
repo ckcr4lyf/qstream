@@ -288,6 +288,7 @@ pub struct ReceiverTransfer {
     outcome: Option<Result<(), String>>,
     unresponsive: bool,
     not_found: bool,
+    retryable_not_found: bool,
     started_at: Instant,
     gap_est: Duration, // EWMA of inter-packet gaps (M5)
     backoff: u32,      // quiet-period backoff exponent
@@ -315,6 +316,7 @@ impl ReceiverTransfer {
             outcome: None,
             unresponsive: false,
             not_found: false,
+            retryable_not_found: false,
             started_at: now,
             gap_est: quiet_period(),
             backoff: 0,
@@ -353,12 +355,17 @@ impl ReceiverTransfer {
     }
 
     /// Fail because the peer replied it doesn't have the segment.
-    pub fn mark_not_found(&mut self) {
-        self.not_found = true;
+    pub fn mark_not_found(&mut self, retryable: bool) {
+        self.retryable_not_found = retryable;
+        self.not_found = !retryable;
     }
 
     pub fn not_found(&self) -> bool {
         self.not_found
+    }
+
+    pub fn retryable_not_found(&self) -> bool {
+        self.retryable_not_found
     }
 
     /// Milliseconds from request to first content packet.
@@ -690,6 +697,7 @@ impl TransferRegistry {
         let msg = Message::SegmentNotFound {
             transfer_id,
             availability: self.segment_availability(),
+            retryable: false,
         };
         fault.send(socket, protocol::encode(&msg), src, Instant::now());
     }
@@ -749,9 +757,15 @@ impl TransferRegistry {
         fault: &mut FaultInjector,
         transfer_id: u16,
         src: SocketAddr,
+        retryable: bool,
     ) {
         self.events.push(RegEvent::NotFound { src });
-        self.send_not_found(socket, fault, transfer_id, src);
+        let msg = Message::SegmentNotFound {
+            transfer_id,
+            availability: self.segment_availability(),
+            retryable,
+        };
+        fault.send(socket, protocol::encode(&msg), src, Instant::now());
     }
 
     /// Start a download from `remote`; returns the transfer id.
@@ -844,12 +858,22 @@ impl TransferRegistry {
         Some(SegmentAvailability { newest, mask })
     }
 
-    pub fn on_not_found(&mut self, _socket: &UdpSocket, transfer_id: u16) -> Option<String> {
+    pub fn on_not_found(
+        &mut self,
+        _socket: &UdpSocket,
+        transfer_id: u16,
+        retryable: bool,
+    ) -> Option<(String, bool)> {
         if let Some(r) = self.receivers.get_mut(&transfer_id) {
             let filename = r.filename.clone();
-            r.mark_not_found();
-            r.fail(format!("peer does not have {filename}"));
-            Some(filename)
+            r.mark_not_found(retryable);
+            let reason = if retryable {
+                format!("peer is temporarily not ready for {filename}")
+            } else {
+                format!("peer does not have {filename}")
+            };
+            r.fail(reason);
+            Some((filename, retryable))
         } else {
             log::trace(&format!(
                 "NOT_FOUND for unknown transfer {transfer_id:#06x}"
@@ -875,6 +899,13 @@ impl TransferRegistry {
         self.receivers
             .get(&id)
             .map(ReceiverTransfer::not_found)
+            .unwrap_or(false)
+    }
+
+    pub fn receiver_retryable_not_found(&self, id: u16) -> bool {
+        self.receivers
+            .get(&id)
+            .map(ReceiverTransfer::retryable_not_found)
             .unwrap_or(false)
     }
 

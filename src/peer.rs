@@ -368,6 +368,7 @@ fn schedule_jobs(
         Result<(), String>,
         bool,
         bool,
+        bool,
         Option<u64>,
         Option<u64>,
     )> = {
@@ -383,6 +384,7 @@ fn schedule_jobs(
                     outcome,
                     node.registry.receiver_unresponsive(*id),
                     node.registry.receiver_not_found(*id),
+                    node.registry.receiver_retryable_not_found(*id),
                     node.registry.receiver_first_packet_ms(*id),
                     node.registry.receiver_saved_bytes(*id),
                 ));
@@ -390,7 +392,16 @@ fn schedule_jobs(
         }
         v
     };
-    for (id, job, outcome, unresponsive, not_found, latency, bytes) in finished {
+    for (
+        id,
+        job,
+        outcome,
+        unresponsive,
+        not_found,
+        retryable_not_found,
+        latency,
+        bytes,
+    ) in finished {
         active.remove(&id);
         if outcome.is_ok() {
             // Let the registry keep the receiver in grace (COMPLETE_GRACE)
@@ -402,6 +413,8 @@ fn schedule_jobs(
             PullResult::Ok
         } else if unresponsive {
             PullResult::Timeout
+        } else if retryable_not_found {
+            PullResult::RetryableNotFound
         } else if not_found {
             PullResult::NotFound
         } else {
@@ -422,6 +435,13 @@ fn schedule_jobs(
                 // Keep the receiver in the registry for its grace period so
                 // it can re-ACK COMPLETE to a sender whose final ACK was
                 // lost (M5); the registry removes it after COMPLETE_GRACE.
+            }
+            PullResult::RetryableNotFound => {
+                log::debug(&format!(
+                    "segment {} temporarily unavailable from {}",
+                    job.filename, job.peer
+                ));
+                queue.push_back(job.filename);
             }
             _ => {
                 log::warn(&format!(
