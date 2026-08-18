@@ -328,3 +328,11 @@ Seed-budget denials use the additive `SEGMENT_NOT_READY` flag on
 without recording a definitive missing segment or incrementing ordinary
 `NOT_FOUND` churn counters. Genuine file absence remains an unflagged
 `SEGMENT_NOT_FOUND`.
+
+**Final staged verification:** after deploying `fe04eb8`, VPS-2 completed 23
+pulls in a 57-second interval: 17 from `183.178.210.60:4447`, 6 from
+`121.202.204.206:4447`, and 0 from the master. It recorded 0 definitive
+`NOT_FOUND` pulls and playback returned HTTP 200. Both remote endpoints
+remained distinct after the duplicate-name identity fix. The master reported
+130 seed assignments and 170 temporary denials at the sample point; those
+origin denials did not become VPS-2 definitive missing-segment failures.
