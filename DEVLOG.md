@@ -310,3 +310,13 @@ using the default display name `peer` were re-keyed over each other when their
 PINGs arrived. Peer names are not identities, so public socket endpoints are
 now kept independently. This is required for stable parent assignments and
 inventory tracking when users leave the default name unchanged.
+
+## Bounded origin seeding (2026-08-18) — STAGE 3
+
+The master now maintains a per-segment origin seed lease. By default,
+`QSTREAM_ORIGIN_SEEDERS=2`: the first two viable peers requesting a segment
+are allowed to seed it, while later origin requests receive the normal
+`SEGMENT_NOT_FOUND` response and must use the peer overlay. Existing leases
+remain valid, stale/absent seeders can be replaced, and the master does not
+apply the budget to segments it does not have. Assignment and denial counters
+are exposed in `/metrics`.

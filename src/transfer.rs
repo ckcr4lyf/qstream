@@ -650,6 +650,10 @@ impl TransferRegistry {
         &self.segment_root
     }
 
+    pub fn has_segment(&self, filename: &str) -> bool {
+        self.segment_root.join(filename).is_file()
+    }
+
     /// Take recorded serve outcomes (drained by the node layer).
     pub fn drain_events(&mut self) -> Vec<RegEvent> {
         std::mem::take(&mut self.events)
@@ -735,6 +739,19 @@ impl TransferRegistry {
                 self.send_not_found(socket, fault, transfer_id, src);
             }
         }
+    }
+
+    /// Reject a request while preserving the normal NOT_FOUND wire response
+    /// and requester-side availability update.
+    pub fn reject_not_found(
+        &mut self,
+        socket: &UdpSocket,
+        fault: &mut FaultInjector,
+        transfer_id: u16,
+        src: SocketAddr,
+    ) {
+        self.events.push(RegEvent::NotFound { src });
+        self.send_not_found(socket, fault, transfer_id, src);
     }
 
     /// Start a download from `remote`; returns the transfer id.

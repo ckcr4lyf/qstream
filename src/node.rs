@@ -158,6 +158,11 @@ pub struct Node {
     /// Exact negative answers from a peer. These suppress retries while a
     /// positive bitmap catches up with retention or filesystem changes.
     missing_segments: HashMap<(SocketAddr, u64), Instant>,
+    /// Per-segment origin seed assignments. The master serves a segment to a
+    /// bounded set of peers; those peers fan it out to the rest of the swarm.
+    origin_seeders: HashMap<String, HashSet<SocketAddr>>,
+    origin_seed_assignments: u64,
+    origin_seed_denials: u64,
     local_addr: SocketAddr,
     next_ping: Instant,
     next_beacon: Instant,
@@ -213,6 +218,9 @@ impl Node {
             paths: HashMap::new(),
             availability: HashMap::new(),
             missing_segments: HashMap::new(),
+            origin_seeders: HashMap::new(),
+            origin_seed_assignments: 0,
+            origin_seed_denials: 0,
             local_addr,
             next_ping: Instant::now() + PING_INTERVAL,
             next_beacon: Instant::now() + BEACON_INTERVAL,
@@ -270,6 +278,63 @@ impl Node {
             self.missing_segments
                 .insert((peer, number), Instant::now() + MISSING_TTL);
         }
+    }
+
+    /// Decide whether the master may seed `filename` to `peer`. A peer that
+    /// already has a lease remains allowed; new leases stop at the budget.
+    fn origin_seed_allowed(&mut self, filename: &str, peer: SocketAddr) -> bool {
+        if self.role != "master" || !self.registry.has_segment(filename) {
+            return true;
+        }
+        const DEFAULT_ORIGIN_SEEDERS: usize = 2;
+        let limit = std::env::var("QSTREAM_ORIGIN_SEEDERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_ORIGIN_SEEDERS);
+        let now = Instant::now();
+        let viable: HashSet<SocketAddr> = self
+            .origin_seeders
+            .get(filename)
+            .into_iter()
+            .flat_map(|seeders| seeders.iter().copied())
+            .filter(|candidate| {
+                self.peers.contains_key(candidate)
+                    && self.peer_availability(*candidate, filename, now) != Some(false)
+            })
+            .collect();
+        let seeders = self
+            .origin_seeders
+            .entry(filename.to_string())
+            .or_default();
+        seeders.retain(|candidate| viable.contains(candidate));
+        if seed_lease_allowed(seeders, peer, limit) {
+            if !seeders.contains(&peer) {
+                seeders.insert(peer);
+                self.origin_seed_assignments += 1;
+                log::debug(&format!(
+                    "origin seed lease {} -> {} ({}/{})",
+                    filename,
+                    peer,
+                    seeders.len(),
+                    limit
+                ));
+            }
+            return true;
+        }
+        if seeders.len() >= limit {
+            self.origin_seed_denials += 1;
+            return false;
+        }
+        false
+    }
+
+    /// Remove seed leases for peers that have left the master registry.
+    fn prune_origin_seeders(&mut self) {
+        let known: HashSet<SocketAddr> = self.peers.keys().copied().collect();
+        self.origin_seeders.retain(|_, seeders| {
+            seeders.retain(|peer| known.contains(peer));
+            !seeders.is_empty()
+        });
     }
 
     /// Push the current store inventory to known peers after a segment lands.
@@ -494,6 +559,7 @@ impl Node {
         }
 
         self.ping_cycle(now);
+        self.prune_origin_seeders();
         if self.prune_segments(now) {
             self.announce_availability();
         }
@@ -851,6 +917,16 @@ impl Node {
                 "counter",
             ),
             (
+                "qstream_origin_seed_assignments_total",
+                "Origin seed leases assigned to peers.",
+                "counter",
+            ),
+            (
+                "qstream_origin_seed_denials_total",
+                "Origin seed requests denied after the per-segment budget.",
+                "counter",
+            ),
+            (
                 "qstream_peer_score",
                 "Quality score 0-100 for a known peer.",
                 "gauge",
@@ -927,6 +1003,16 @@ impl Node {
         );
         s("qstream_queue_depth", &nl, self.queue_depth);
         s("qstream_inflight", &nl, self.inflight);
+        s(
+            "qstream_origin_seed_assignments_total",
+            &nl,
+            self.origin_seed_assignments,
+        );
+        s(
+            "qstream_origin_seed_denials_total",
+            &nl,
+            self.origin_seed_denials,
+        );
         s("qstream_rss_bytes", &nl, Self::rss_bytes());
         if self.fault.enabled() {
             s("qstream_fault_dropped_total", &nl, self.fault.stats.dropped);
@@ -1149,8 +1235,22 @@ impl Node {
                 transfer_id,
                 filename,
             } => {
-                self.registry
-                    .serve(&self.socket, &mut self.fault, transfer_id, &filename, src);
+                if self.origin_seed_allowed(&filename, src) {
+                    self.registry.serve(
+                        &self.socket,
+                        &mut self.fault,
+                        transfer_id,
+                        &filename,
+                        src,
+                    );
+                } else {
+                    self.registry.reject_not_found(
+                        &self.socket,
+                        &mut self.fault,
+                        transfer_id,
+                        src,
+                    );
+                }
                 Event::None
             }
             Message::SegmentContents {
@@ -1232,6 +1332,17 @@ mod tests {
         assert_eq!(stat.downloaded_bytes, 1234);
         assert_eq!(stat.uploaded_bytes, 5678);
     }
+
+    #[test]
+    fn origin_seed_lease_is_bounded_but_reentrant() {
+        let first = "127.0.0.1:1001".parse().unwrap();
+        let second = "127.0.0.1:1002".parse().unwrap();
+        let third = "127.0.0.1:1003".parse().unwrap();
+        let seeders = HashSet::from([first, second]);
+        assert!(seed_lease_allowed(&seeders, first, 2));
+        assert!(!seed_lease_allowed(&seeders, third, 2));
+        assert!(seed_lease_allowed(&HashSet::new(), third, 2));
+    }
 }
 
 /// Do two addresses share an IPv4 address? (Peerlist SAME_IP flag, N1.)
@@ -1245,6 +1356,10 @@ fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
 /// Is `addr` a globally reachable endpoint (not loopback, not RFC1918)?
 /// Loopback/private peers of the master are meaningless to a remote peer;
 /// they must not be advertised (or handshaken) across the internet.
+fn seed_lease_allowed(seeders: &HashSet<SocketAddr>, peer: SocketAddr, limit: usize) -> bool {
+    seeders.contains(&peer) || seeders.len() < limit
+}
+
 fn segment_number(name: &str) -> Option<u64> {
     name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
 }
