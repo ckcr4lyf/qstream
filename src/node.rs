@@ -308,7 +308,13 @@ impl Node {
             .entry(filename.to_string())
             .or_default();
         seeders.retain(|candidate| viable.contains(candidate));
-        if seed_lease_allowed(seeders, peer, limit) {
+        let requester_is_remote = remote_public(peer);
+        let reachable_seeders: HashSet<SocketAddr> = seeders
+            .iter()
+            .copied()
+            .filter(|candidate| !requester_is_remote || remote_public(*candidate))
+            .collect();
+        if seed_lease_allowed(&reachable_seeders, peer, limit) {
             if !seeders.contains(&peer) {
                 seeders.insert(peer);
                 self.origin_seed_assignments += 1;
@@ -330,6 +336,7 @@ impl Node {
         let now = Instant::now();
         let peer_source_exists = self.peers.keys().any(|candidate| {
             *candidate != peer
+                && (!requester_is_remote || remote_public(*candidate))
                 && self.peer_availability(*candidate, filename, now) == Some(true)
         });
         if !peer_source_exists {

@@ -123,6 +123,7 @@ pub fn run(
     let mut queued: HashSet<String> = HashSet::new(); // queued or in-flight
     let mut tried: HashMap<String, HashSet<SocketAddr>> = HashMap::new();
     let mut failed_at: HashMap<String, Instant> = HashMap::new();
+    let mut retry_after: HashMap<(String, SocketAddr), Instant> = HashMap::new();
     let mut parents: HashSet<SocketAddr> = HashSet::new();
     let mut parent_wait: HashMap<String, Instant> = HashMap::new();
     let mut unresponsive_hits: HashMap<SocketAddr, u32> = HashMap::new();
@@ -330,6 +331,7 @@ pub fn run(
             &parents,
             &mut parent_wait,
             &mut failed_at,
+            &mut retry_after,
             &mut unresponsive_hits,
             &data_dir,
             playback_holdback,
@@ -353,6 +355,7 @@ fn schedule_jobs(
     parents: &HashSet<SocketAddr>,
     parent_wait: &mut HashMap<String, Instant>,
     failed_at: &mut HashMap<String, Instant>,
+    retry_after: &mut HashMap<(String, SocketAddr), Instant>,
     unresponsive_hits: &mut HashMap<SocketAddr, u32>,
     data_dir: &Path,
     playback_holdback: usize,
@@ -431,6 +434,7 @@ fn schedule_jobs(
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);
                 parent_wait.remove(&job.filename);
+                retry_after.retain(|(filename, _), _| filename != &job.filename);
                 unresponsive_hits.remove(&job.peer);
                 // Keep the receiver in the registry for its grace period so
                 // it can re-ACK COMPLETE to a sender whose final ACK was
@@ -441,6 +445,13 @@ fn schedule_jobs(
                     "segment {} temporarily unavailable from {}",
                     job.filename, job.peer
                 ));
+                retry_after.insert(
+                    (job.filename.clone(), job.peer),
+                    now + FAIL_RETRY_COOLDOWN,
+                );
+                if let Some(tried_for) = tried.get_mut(&job.filename) {
+                    tried_for.remove(&job.peer);
+                }
                 queue.push_back(job.filename);
             }
             _ => {
@@ -496,6 +507,7 @@ fn schedule_jobs(
             &filename,
             local_addr,
             bootstrap,
+            retry_after,
             rng,
         )
         else {
@@ -539,6 +551,7 @@ fn pick_peer(
     filename: &str,
     local_addr: SocketAddr,
     bootstrap: SocketAddr,
+    retry_after: &HashMap<(String, SocketAddr), Instant>,
     rng: &mut Rng,
 ) -> Option<SocketAddr> {
     let tried_for = tried.get(filename);
@@ -553,7 +566,13 @@ fn pick_peer(
         .map(|p| node.effective_addr(*p))
         .filter(|p| *p != local_addr)
         .filter(|p| node.peer_may_have(*p, filename, now))
-        .filter(|p| tried_for.map(|s| !s.contains(p)).unwrap_or(true))
+        .filter(|p| {
+            let cooling = retry_after
+                .get(&(filename.to_string(), *p))
+                .map(|until| now < *until)
+                .unwrap_or(false);
+            !cooling && tried_for.map(|s| !s.contains(p)).unwrap_or(true)
+        })
         .filter(|p| inflight(p) < MAX_INFLIGHT_PER_PEER)
         .collect();
     let parent_sources: Vec<SocketAddr> = candidates
