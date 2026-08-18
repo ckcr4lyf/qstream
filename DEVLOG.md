@@ -299,3 +299,8 @@ parent when its fresh inventory confirms the requested segment; the master
 remains the fallback when parents are not ready. The existing 7-byte peerlist
 format and protocol version remain unchanged, so legacy peers can ignore the
 new flag.
+
+A five-second parent wait is also applied for known assigned parents. If none
+has a fresh positive inventory for a queued segment, the peer waits briefly
+for parent replication before using the master recovery path. This is bounded
+so a stalled parent cannot hold playback indefinitely.

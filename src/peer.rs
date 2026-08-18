@@ -43,6 +43,10 @@ const MAX_INFLIGHT_PER_PEER: usize = 2;
 /// Unresponsive pulls before a peer is evicted (M5: one timeout can just
 /// be a bad moment; three is a pattern).
 const EVICT_AFTER_UNRESPONSIVE: u32 = 3;
+/// Give assigned parents a short opportunity to receive and announce a new
+/// segment before using the origin. This turns parent assignments into a
+/// real replication path without making a stalled parent permanent.
+const PARENT_WAIT: Duration = Duration::from_secs(5);
 /// Keep this many complete segments beyond the player-facing edge. With the
 /// default 2-second HLS segments, three entries give playback about 6 seconds
 /// to absorb replication jitter without delaying swarm synchronization.
@@ -120,6 +124,7 @@ pub fn run(
     let mut tried: HashMap<String, HashSet<SocketAddr>> = HashMap::new();
     let mut failed_at: HashMap<String, Instant> = HashMap::new();
     let mut parents: HashSet<SocketAddr> = HashSet::new();
+    let mut parent_wait: HashMap<String, Instant> = HashMap::new();
     let mut unresponsive_hits: HashMap<SocketAddr, u32> = HashMap::new();
     let mut rng = Rng::new(0);
 
@@ -323,6 +328,7 @@ pub fn run(
             &mut queued,
             &mut tried,
             &parents,
+            &mut parent_wait,
             &mut failed_at,
             &mut unresponsive_hits,
             &data_dir,
@@ -345,6 +351,7 @@ fn schedule_jobs(
     queued: &mut HashSet<String>,
     tried: &mut HashMap<String, HashSet<SocketAddr>>,
     parents: &HashSet<SocketAddr>,
+    parent_wait: &mut HashMap<String, Instant>,
     failed_at: &mut HashMap<String, Instant>,
     unresponsive_hits: &mut HashMap<SocketAddr, u32>,
     data_dir: &Path,
@@ -410,6 +417,7 @@ fn schedule_jobs(
                 log::info(&format!("segment {} saved", job.filename));
                 queued.remove(&job.filename);
                 tried.remove(&job.filename);
+                parent_wait.remove(&job.filename);
                 unresponsive_hits.remove(&job.peer);
                 // Keep the receiver in the registry for its grace period so
                 // it can re-ACK COMPLETE to a sender whose final ACK was
@@ -464,6 +472,7 @@ fn schedule_jobs(
             active,
             tried,
             parents,
+            parent_wait,
             &filename,
             local_addr,
             bootstrap,
@@ -506,6 +515,7 @@ fn pick_peer(
     active: &HashMap<u16, ActiveJob>,
     tried: &HashMap<String, HashSet<SocketAddr>>,
     parents: &HashSet<SocketAddr>,
+    parent_wait: &mut HashMap<String, Instant>,
     filename: &str,
     local_addr: SocketAddr,
     bootstrap: SocketAddr,
@@ -533,7 +543,18 @@ fn pick_peer(
         .filter(|peer| node.peer_availability(*peer, filename, now) == Some(true))
         .collect();
     if !parent_sources.is_empty() {
+        parent_wait.remove(filename);
         candidates = parent_sources;
+    } else {
+        let has_known_parent = parents.iter().any(|parent| {
+            *parent != local_addr && node.peers.contains_key(parent)
+        });
+        if has_known_parent {
+            let since = parent_wait.entry(filename.to_string()).or_insert(now);
+            if now.duration_since(*since) < PARENT_WAIT {
+                return None;
+            }
+        }
     }
     candidates = prefer_advertised_peers(candidates, bootstrap, |peer| {
         node.peer_availability(peer, filename, now)
