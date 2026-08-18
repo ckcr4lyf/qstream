@@ -321,10 +321,26 @@ impl Node {
             }
             return true;
         }
-        if seeders.len() >= limit {
-            self.origin_seed_denials += 1;
-            return false;
+
+        // Never deny the only recovery path. A lease is only effective after
+        // at least one other known peer has a fresh positive inventory bit.
+        // This keeps the origin bounded during normal fanout but admits a new
+        // seed when the current lease holders failed or are still catching up.
+        let now = Instant::now();
+        let peer_source_exists = self.peers.keys().any(|candidate| {
+            *candidate != peer
+                && self.peer_availability(*candidate, filename, now) == Some(true)
+        });
+        if !peer_source_exists {
+            let seeders = self
+                .origin_seeders
+                .entry(filename.to_string())
+                .or_default();
+            seeders.insert(peer);
+            self.origin_seed_assignments += 1;
+            return true;
         }
+        self.origin_seed_denials += 1;
         false
     }
 

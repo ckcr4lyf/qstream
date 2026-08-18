@@ -319,4 +319,6 @@ are allowed to seed it, while later origin requests receive the normal
 `SEGMENT_NOT_FOUND` response and must use the peer overlay. Existing leases
 remain valid, stale/absent seeders can be replaced, and the master does not
 apply the budget to segments it does not have. Assignment and denial counters
-are exposed in `/metrics`.
+are exposed in `/metrics`. A safety check prevents denial when no other known
+peer has a fresh positive inventory for the segment; in that case the master
+admits a replacement recovery seed even if the nominal budget is full.
