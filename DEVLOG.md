@@ -259,3 +259,18 @@ swarm to fan out new segments from peers instead of forcing all live-edge
 traffic through the master. A future 10,000-peer deployment still needs
 bounded peer discovery and neighbor fanout; source selection alone does not
 make a full-mesh peer list scalable.
+
+## Stale availability correction (2026-08-18) — VERIFIED IN PROGRESS
+
+After adding a second upgraded peer, VPS-2 successfully began pulling pieces
+from `183.178.210.60:4447`, but a few requests still raced against stale
+positive inventory while that peer's retained files changed. The requester
+then retried the same piece against the master, creating avoidable duplicate
+work.
+
+The scheduler now records exact `SEGMENT_NOT_FOUND` answers per peer and piece
+for 15 seconds. A later positive inventory bit clears that negative entry.
+Source selection is also tiered: known non-master copies first, a fresh
+positive master copy second, and unknown candidates only when the master has
+no fresh answer. This removes routine unknown-peer `NOT_FOUND` trials from the
+live window while preserving origin recovery.

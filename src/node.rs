@@ -151,6 +151,9 @@ pub struct Node {
     /// Recent segment inventories learned from upgraded peers. Inventories are
     /// advisory and expire quickly because a live peer's store changes fast.
     availability: HashMap<SocketAddr, (protocol::SegmentAvailability, Instant)>,
+    /// Exact negative answers from a peer. These suppress retries while a
+    /// positive bitmap catches up with retention or filesystem changes.
+    missing_segments: HashMap<(SocketAddr, u64), Instant>,
     local_addr: SocketAddr,
     next_ping: Instant,
     next_beacon: Instant,
@@ -205,6 +208,7 @@ impl Node {
             claims: HashMap::new(),
             paths: HashMap::new(),
             availability: HashMap::new(),
+            missing_segments: HashMap::new(),
             local_addr,
             next_ping: Instant::now() + PING_INTERVAL,
             next_beacon: Instant::now() + BEACON_INTERVAL,
@@ -245,8 +249,23 @@ impl Node {
         peer: SocketAddr,
         availability: protocol::SegmentAvailability,
     ) {
-        self.availability
-            .insert(peer, (availability, Instant::now()));
+        let now = Instant::now();
+        for number in 0..protocol::AVAILABILITY_MASK_BITS {
+            if availability.mask & (1 << number) != 0 {
+                self.missing_segments
+                    .remove(&(peer, availability.newest.saturating_sub(number as u64)));
+            }
+        }
+        self.availability.insert(peer, (availability, now));
+    }
+
+    /// Record an exact negative response for a requested segment.
+    pub fn record_missing(&mut self, peer: SocketAddr, filename: &str) {
+        const MISSING_TTL: Duration = Duration::from_secs(15);
+        if let Some(number) = segment_number(filename) {
+            self.missing_segments
+                .insert((peer, number), Instant::now() + MISSING_TTL);
+        }
     }
 
     /// Push the current store inventory to known peers after a segment lands.
@@ -273,6 +292,11 @@ impl Node {
     ) -> Option<bool> {
         const AVAILABILITY_TTL: Duration = Duration::from_secs(15);
         let number = segment_number(filename)?;
+        if let Some(expires_at) = self.missing_segments.get(&(peer, number)) {
+            if now < *expires_at {
+                return Some(false);
+            }
+        }
         let (availability, observed_at) = self.availability.get(&peer)?;
         if now.duration_since(*observed_at) > AVAILABILITY_TTL {
             return None;
@@ -1115,7 +1139,9 @@ impl Node {
                 if let Some(availability) = availability {
                     self.record_availability(src, availability);
                 }
-                self.registry.on_not_found(&self.socket, transfer_id);
+                if let Some(filename) = self.registry.on_not_found(&self.socket, transfer_id) {
+                    self.record_missing(src, &filename);
+                }
                 Event::None
             }
             Message::Ack {

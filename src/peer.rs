@@ -559,13 +559,23 @@ where
         .filter(|p| *p != bootstrap)
         .filter(|p| availability(*p) == Some(true))
         .collect();
-    if peer_sources.is_empty() {
-        candidates
-    } else {
+    if !peer_sources.is_empty() {
         // Once any non-origin peer proves it has the piece, keep the origin
         // out of this request entirely. The master is a fallback, not a
         // competing source for every replicated segment.
-        peer_sources
+        return peer_sources;
+    }
+
+    // If the origin has a fresh positive answer, unknown peers are not worth
+    // a NOT_FOUND trial. Unknown peers remain useful for segments outside the
+    // origin's inventory window, or while the origin's inventory is stale.
+    if availability(bootstrap) == Some(true) {
+        candidates
+            .into_iter()
+            .filter(|p| *p == bootstrap)
+            .collect()
+    } else {
+        candidates
     }
 }
 
@@ -632,6 +642,16 @@ mod tests {
         let candidates = vec![master, peer];
         let selected = prefer_advertised_peers(candidates.clone(), master, |_| None);
         assert_eq!(selected, candidates);
+    }
+
+    #[test]
+    fn unknown_peer_does_not_compete_with_positive_master() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let selected = prefer_advertised_peers(vec![master, peer], master, |addr| {
+            (addr == master).then_some(true)
+        });
+        assert_eq!(selected, vec![master]);
     }
 }
 

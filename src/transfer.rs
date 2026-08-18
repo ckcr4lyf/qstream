@@ -819,15 +819,17 @@ impl TransferRegistry {
         Some(SegmentAvailability { newest, mask })
     }
 
-    pub fn on_not_found(&mut self, _socket: &UdpSocket, transfer_id: u16) {
+    pub fn on_not_found(&mut self, _socket: &UdpSocket, transfer_id: u16) -> Option<String> {
         if let Some(r) = self.receivers.get_mut(&transfer_id) {
             let filename = r.filename.clone();
             r.mark_not_found();
             r.fail(format!("peer does not have {filename}"));
+            Some(filename)
         } else {
             log::trace(&format!(
                 "NOT_FOUND for unknown transfer {transfer_id:#06x}"
             ));
+            None
         }
     }
 
