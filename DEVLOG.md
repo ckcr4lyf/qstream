@@ -288,3 +288,14 @@ recorded only after `ACK_COMPLETE`, so failed or abandoned sends are excluded.
 The fields are exposed in `/peers`, `/stats`, and Prometheus metrics as
 `qstream_peer_downloaded_bytes_total` and
 `qstream_peer_uploaded_bytes_total`.
+
+## Bounded parent assignments (2026-08-18) — STAGE 1
+
+The previous scheduler knew which peers had pieces but did not coordinate
+replication. The master now returns at most 16 reachable peers in each
+peerlist response and marks up to two low-load peers with the additive
+`PEER_PARENT` flag. Peers retain only the current assignment and prefer a
+parent when its fresh inventory confirms the requested segment; the master
+remains the fallback when parents are not ready. The existing 7-byte peerlist
+format and protocol version remain unchanged, so legacy peers can ignore the
+new flag.

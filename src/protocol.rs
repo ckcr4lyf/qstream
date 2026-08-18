@@ -15,6 +15,7 @@ pub const AVAILABILITY_MASK_BITS: u32 = 16;
 /// Peerlist entry flags (N1):
 pub const PEER_UPNP_MAPPED: u8 = 0x01; // claimed endpoint == observed (verified mapping)
 pub const PEER_SAME_IP: u8 = 0x02; // same public IP as the requester (likely same NAT)
+pub const PEER_PARENT: u8 = 0x04; // assigned preferred source by the master
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,7 +661,10 @@ mod tests {
     fn roundtrip_peerlist_response() {
         let msg = Message::PeerlistResponse {
             peers: vec![
-                (SocketAddr::from(([127, 0, 0, 1], 4444)), PEER_UPNP_MAPPED),
+                (
+                    SocketAddr::from(([127, 0, 0, 1], 4444)),
+                    PEER_UPNP_MAPPED | PEER_PARENT,
+                ),
                 (SocketAddr::from(([10, 0, 0, 2], 5555)), 0),
             ],
         };
@@ -671,13 +675,16 @@ mod tests {
     fn peerlist_response_wire_format() {
         let msg = Message::PeerlistResponse {
             peers: vec![
-                (SocketAddr::from(([127, 0, 0, 1], 4444)), PEER_UPNP_MAPPED),
+                (
+                    SocketAddr::from(([127, 0, 0, 1], 4444)),
+                    PEER_UPNP_MAPPED | PEER_PARENT,
+                ),
                 (SocketAddr::from(([10, 0, 0, 2], 5555)), 0),
             ],
         };
         let expected: Vec<u8> = vec![
             0x51, 0x53, 0x54, 0x03, 0x51, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x7F, 0x00, 0x00, 0x01, 0x11, 0x5C, 0x01, // 127.0.0.1:4444, upnp
+            0x7F, 0x00, 0x00, 0x01, 0x11, 0x5C, 0x05, // 127.0.0.1:4444, upnp + parent
             0x0A, 0x00, 0x00, 0x02, 0x15, 0xB3, 0x00, // 10.0.0.2:5555
         ];
         assert_eq!(encode(&msg), expected);

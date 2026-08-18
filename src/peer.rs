@@ -20,7 +20,7 @@ use crate::fault::Rng;
 use crate::http;
 use crate::log;
 use crate::node::{Event, Node, PullResult, StatsSnapshot};
-use crate::protocol::{self, Message, PEER_SAME_IP};
+use crate::protocol::{self, Message, PEER_PARENT, PEER_SAME_IP};
 use crate::transfer;
 use crate::upnp;
 
@@ -119,6 +119,7 @@ pub fn run(
     let mut queued: HashSet<String> = HashSet::new(); // queued or in-flight
     let mut tried: HashMap<String, HashSet<SocketAddr>> = HashMap::new();
     let mut failed_at: HashMap<String, Instant> = HashMap::new();
+    let mut parents: HashSet<SocketAddr> = HashSet::new();
     let mut unresponsive_hits: HashMap<SocketAddr, u32> = HashMap::new();
     let mut rng = Rng::new(0);
 
@@ -210,6 +211,7 @@ pub fn run(
                         poll_timeout = None;
                     }
                     Event::PeerlistResponse { peers } => {
+                        parents.clear();
                         // We're "remote" if our observed public endpoint is
                         // globally reachable; then the master's loopback/
                         // private peers (its local swarm) are unreachable
@@ -232,6 +234,9 @@ pub fn run(
                             // NAT's hairpin behavior (N3).
                             if flags & PEER_SAME_IP != 0 {
                                 continue;
+                            }
+                            if flags & PEER_PARENT != 0 {
+                                parents.insert(peer);
                             }
                             if node.peers.contains_key(&peer)
                                 || pending_handshakes.contains_key(&peer)
@@ -317,6 +322,7 @@ pub fn run(
             &mut pull_queue,
             &mut queued,
             &mut tried,
+            &parents,
             &mut failed_at,
             &mut unresponsive_hits,
             &data_dir,
@@ -338,6 +344,7 @@ fn schedule_jobs(
     queue: &mut VecDeque<String>,
     queued: &mut HashSet<String>,
     tried: &mut HashMap<String, HashSet<SocketAddr>>,
+    parents: &HashSet<SocketAddr>,
     failed_at: &mut HashMap<String, Instant>,
     unresponsive_hits: &mut HashMap<SocketAddr, u32>,
     data_dir: &Path,
@@ -452,7 +459,16 @@ fn schedule_jobs(
         let Some(filename) = queue.pop_front() else {
             break;
         };
-        let Some(peer) = pick_peer(node, active, tried, &filename, local_addr, bootstrap, rng)
+        let Some(peer) = pick_peer(
+            node,
+            active,
+            tried,
+            parents,
+            &filename,
+            local_addr,
+            bootstrap,
+            rng,
+        )
         else {
             queue.push_front(filename);
             break;
@@ -489,6 +505,7 @@ fn pick_peer(
     node: &Node,
     active: &HashMap<u16, ActiveJob>,
     tried: &HashMap<String, HashSet<SocketAddr>>,
+    parents: &HashSet<SocketAddr>,
     filename: &str,
     local_addr: SocketAddr,
     bootstrap: SocketAddr,
@@ -509,6 +526,15 @@ fn pick_peer(
         .filter(|p| tried_for.map(|s| !s.contains(p)).unwrap_or(true))
         .filter(|p| inflight(p) < MAX_INFLIGHT_PER_PEER)
         .collect();
+    let parent_sources: Vec<SocketAddr> = candidates
+        .iter()
+        .copied()
+        .filter(|peer| parents.contains(peer))
+        .filter(|peer| node.peer_availability(*peer, filename, now) == Some(true))
+        .collect();
+    if !parent_sources.is_empty() {
+        candidates = parent_sources;
+    }
     candidates = prefer_advertised_peers(candidates, bootstrap, |peer| {
         node.peer_availability(peer, filename, now)
     });

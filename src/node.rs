@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::fault::FaultInjector;
 use crate::log;
-use crate::protocol::{self, Message, PEER_SAME_IP, PEER_UPNP_MAPPED};
+use crate::protocol::{self, Message, PEER_PARENT, PEER_SAME_IP, PEER_UPNP_MAPPED};
 use crate::transfer::{self, RegEvent, TransferRegistry};
 
 /// PING every peer on this cadence (N2): each PING is a keep-alive that
@@ -1113,21 +1113,43 @@ impl Node {
                 // private endpoints are only meaningful to peers on the
                 // same host/LAN — don't advertise them to remote peers
                 // (DEVLOG: home peer wasted handshakes on 127.0.0.1).
+                const MAX_ADVERTISED_PEERS: usize = 16;
+                const PARENT_COUNT: usize = 2;
                 let requester_remote = remote_public(src);
-                let peers: Vec<(SocketAddr, u8)> = self
+                let mut candidates: Vec<SocketAddr> = self
                     .peers
                     .keys()
-                    .filter(|p| **p != src)
-                    .filter(|p| !(requester_remote && !remote_public(**p)))
+                    .copied()
+                    .filter(|p| *p != src)
+                    .filter(|p| !(requester_remote && !remote_public(*p)))
+                    .collect();
+                // Prefer peers that have served less so parent assignments
+                // spread origin and upload work across the swarm.
+                candidates.sort_by(|a, b| {
+                    let a_served = self.peer_stats.get(a).map(|s| s.served).unwrap_or(0);
+                    let b_served = self.peer_stats.get(b).map(|s| s.served).unwrap_or(0);
+                    a_served.cmp(&b_served).then(a.cmp(b))
+                });
+                let parents: HashSet<SocketAddr> = candidates
+                    .iter()
+                    .copied()
+                    .take(PARENT_COUNT)
+                    .collect();
+                let peers: Vec<(SocketAddr, u8)> = candidates
+                    .into_iter()
+                    .take(MAX_ADVERTISED_PEERS)
                     .map(|p| {
                         let mut flags = 0u8;
-                        if self.claims.get(p) == Some(p) {
+                        if self.claims.get(&p) == Some(&p) {
                             flags |= PEER_UPNP_MAPPED;
                         }
-                        if same_ip4(*p, src) {
+                        if same_ip4(p, src) {
                             flags |= PEER_SAME_IP;
                         }
-                        (*p, flags)
+                        if parents.contains(&p) {
+                            flags |= PEER_PARENT;
+                        }
+                        (p, flags)
                     })
                     .collect();
                 let n = peers.len();
