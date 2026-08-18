@@ -739,6 +739,26 @@ mod tests {
         });
         assert_eq!(selected, vec![master]);
     }
+
+    #[test]
+    fn sync_queue_discards_jobs_outside_current_live_window() {
+        let root = std::env::temp_dir().join(format!(
+            "qstream-sync-queue-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = b"#EXTM3U\nseg_20.ts\nseg_21.ts\n";
+        let mut queue = VecDeque::from(["seg_1.ts".to_string(), "seg_20.ts".to_string()]);
+        let mut queued = HashSet::from([
+            "seg_1.ts".to_string(),
+            "seg_20.ts".to_string(),
+            "seg_99.ts".to_string(),
+        ]);
+        sync_queue(&root, manifest, &mut queue, &mut queued, &HashMap::new());
+        assert_eq!(queue, VecDeque::from(["seg_21.ts".to_string(), "seg_20.ts".to_string()]));
+        assert_eq!(queued, HashSet::from(["seg_20.ts".to_string(), "seg_21.ts".to_string()]));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn sync_queue(
@@ -748,7 +768,16 @@ fn sync_queue(
     queued: &mut HashSet<String>,
     failed_at: &HashMap<String, Instant>,
 ) {
-    for filename in transfer::parse_manifest(manifest) {
+    let manifest_segments = transfer::parse_manifest(manifest);
+    let wanted: HashSet<&str> = manifest_segments.iter().map(String::as_str).collect();
+
+    // A restart can leave a peer behind the moving live window. Jobs that
+    // rolled out cannot be recovered from the compact availability window;
+    // keeping them ahead of current segments deadlocks the scheduler.
+    queue.retain(|filename| wanted.contains(filename.as_str()));
+    queued.retain(|filename| wanted.contains(filename.as_str()));
+
+    for filename in manifest_segments {
         if !transfer::valid_filename(&filename) {
             continue;
         }
