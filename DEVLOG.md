@@ -274,3 +274,7 @@ Source selection is also tiered: known non-master copies first, a fresh
 positive master copy second, and unknown candidates only when the master has
 no fresh answer. This removes routine unknown-peer `NOT_FOUND` trials from the
 live window while preserving origin recovery.
+
+Retention pruning now immediately announces a fresh inventory when files are
+removed. This closes the stale-positive window without increasing the normal
+announcement cadence.

@@ -488,7 +488,9 @@ impl Node {
         }
 
         self.ping_cycle(now);
-        self.prune_segments(now);
+        if self.prune_segments(now) {
+            self.announce_availability();
+        }
         self.publish_snapshot(now);
         self.log_ranking(now);
     }
@@ -525,9 +527,10 @@ impl Node {
     /// Delete segments that rolled out of the playlist and are older than
     /// the retention window (M5): viewers may be 3-4 s behind the edge, so
     /// old pieces must stay servable for a while. `QSTREAM_RETENTION_SECS`.
-    fn prune_segments(&mut self, now: Instant) {
+    /// Returns true when the advertised inventory changed.
+    fn prune_segments(&mut self, now: Instant) -> bool {
         if self.retention_secs == 0 || now < self.next_prune {
-            return;
+            return false;
         }
         self.next_prune = now + Duration::from_secs(30);
         let manifest = fs::read(&self.manifest_path).unwrap_or_default();
@@ -536,8 +539,9 @@ impl Node {
         let retention = Duration::from_secs(self.retention_secs);
         let root = self.registry.segment_root().to_path_buf();
         let Ok(entries) = fs::read_dir(&root) else {
-            return;
+            return false;
         };
+        let mut removed = false;
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let is_segment = name.starts_with("seg_") && name.ends_with(".ts");
@@ -557,11 +561,15 @@ impl Node {
             };
             if age >= retention {
                 match fs::remove_file(entry.path()) {
-                    Ok(()) => log::debug(&format!("pruned old segment {name}")),
+                    Ok(()) => {
+                        removed = true;
+                        log::debug(&format!("pruned old segment {name}"));
+                    }
                     Err(e) => log::debug(&format!("prune {name} failed: {e}")),
                 }
             }
         }
+        removed
     }
 
     /// Refresh the shared stats snapshot the HTTP server serves at /peers
