@@ -304,10 +304,7 @@ impl Node {
                     && self.peer_availability(*candidate, filename, now) != Some(false)
             })
             .collect();
-        let seeders = self
-            .origin_seeders
-            .entry(filename.to_string())
-            .or_default();
+        let seeders = self.origin_seeders.entry(filename.to_string()).or_default();
         seeders.retain(|candidate| viable.contains(candidate));
         let requester_is_remote = remote_public(peer);
         let reachable_seeders: HashSet<SocketAddr> = seeders
@@ -342,10 +339,7 @@ impl Node {
                 && self.peer_availability(*candidate, filename, now) == Some(true)
         });
         if !peer_source_exists {
-            let seeders = self
-                .origin_seeders
-                .entry(filename.to_string())
-                .or_default();
+            let seeders = self.origin_seeders.entry(filename.to_string()).or_default();
             seeders.insert(peer);
             self.origin_seed_assignments += 1;
             return true;
@@ -387,10 +381,10 @@ impl Node {
     ) -> Option<bool> {
         const AVAILABILITY_TTL: Duration = Duration::from_secs(15);
         let number = segment_number(filename)?;
-        if let Some(expires_at) = self.missing_segments.get(&(peer, number)) {
-            if now < *expires_at {
-                return Some(false);
-            }
+        if let Some(expires_at) = self.missing_segments.get(&(peer, number))
+            && now < *expires_at
+        {
+            return Some(false);
         }
         let (availability, observed_at) = self.availability.get(&peer)?;
         if now.duration_since(*observed_at) > AVAILABILITY_TTL {
@@ -680,12 +674,12 @@ impl Node {
             return;
         }
         self.next_snapshot = now + Duration::from_secs(5);
-        if let Some(sink) = &self.stats_sink {
-            if let Ok(mut guard) = sink.lock() {
-                guard.lines = self.stats_lines(now);
-                guard.json = self.stats_json(now);
-                guard.metrics = self.metrics_text(now);
-            }
+        if let Some(sink) = &self.stats_sink
+            && let Ok(mut guard) = sink.lock()
+        {
+            guard.lines = self.stats_lines(now);
+            guard.json = self.stats_json(now);
+            guard.metrics = self.metrics_text(now);
         }
     }
 
@@ -730,11 +724,10 @@ impl Node {
                 if let Some(rest) = name
                     .strip_prefix("seg_")
                     .and_then(|n| n.strip_suffix(".ts"))
+                    && let Ok(num) = rest.parse::<u64>()
                 {
-                    if let Ok(num) = rest.parse::<u64>() {
-                        count += 1;
-                        newest = newest.max(num);
-                    }
+                    count += 1;
+                    newest = newest.max(num);
                 }
             }
         }
@@ -1085,7 +1078,7 @@ impl Node {
             return;
         }
         let mut ranked: Vec<(&SocketAddr, &PeerStat)> = self.peer_stats.iter().collect();
-        ranked.sort_by(|a, b| b.1.score.cmp(&a.1.score));
+        ranked.sort_by_key(|b| std::cmp::Reverse(b.1.score));
         let parts: Vec<String> = ranked
             .iter()
             .take(8)
@@ -1168,8 +1161,8 @@ impl Node {
                         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
                         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local(),
                     };
-                    if is_lan_source {
-                        self.paths.get_mut(&src).map(|p| p.lan = true);
+                    if is_lan_source && let Some(path) = self.paths.get_mut(&src) {
+                        path.lan = true;
                     }
                 }
                 let pong = Message::Pong {
@@ -1225,11 +1218,8 @@ impl Node {
                     let b_served = self.peer_stats.get(b).map(|s| s.served).unwrap_or(0);
                     a_served.cmp(&b_served).then(a.cmp(b))
                 });
-                let parents: HashSet<SocketAddr> = candidates
-                    .iter()
-                    .copied()
-                    .take(PARENT_COUNT)
-                    .collect();
+                let parents: HashSet<SocketAddr> =
+                    candidates.iter().copied().take(PARENT_COUNT).collect();
                 let peers: Vec<(SocketAddr, u8)> = candidates
                     .into_iter()
                     .take(MAX_ADVERTISED_PEERS)
@@ -1265,13 +1255,8 @@ impl Node {
                 filename,
             } => {
                 if self.origin_seed_allowed(&filename, src) {
-                    self.registry.serve(
-                        &self.socket,
-                        &mut self.fault,
-                        transfer_id,
-                        &filename,
-                        src,
-                    );
+                    self.registry
+                        .serve(&self.socket, &mut self.fault, transfer_id, &filename, src);
                 } else {
                     self.registry.reject_not_found(
                         &self.socket,
@@ -1309,11 +1294,11 @@ impl Node {
                     self.record_availability(src, availability);
                 }
                 if let Some((filename, retryable)) =
-                    self.registry.on_not_found(&self.socket, transfer_id, retryable)
+                    self.registry
+                        .on_not_found(&self.socket, transfer_id, retryable)
+                    && !retryable
                 {
-                    if !retryable {
-                        self.record_missing(src, &filename);
-                    }
+                    self.record_missing(src, &filename);
                 }
                 Event::None
             }
@@ -1348,6 +1333,32 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
+/// Do two addresses share an IPv4 address? (Peerlist SAME_IP flag, N1.)
+fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
+    match (a, b) {
+        (SocketAddr::V4(x), SocketAddr::V4(y)) => x.ip() == y.ip(),
+        _ => false,
+    }
+}
+
+/// Is `addr` a globally reachable endpoint (not loopback, not RFC1918)?
+/// Loopback/private peers of the master are meaningless to a remote peer;
+/// they must not be advertised (or handshaken) across the internet.
+fn seed_lease_allowed(seeders: &HashSet<SocketAddr>, peer: SocketAddr, limit: usize) -> bool {
+    seeders.contains(&peer) || seeders.len() < limit
+}
+
+fn segment_number(name: &str) -> Option<u64> {
+    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
+}
+
+pub fn remote_public(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_private(),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unicast_link_local(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1377,31 +1388,5 @@ mod tests {
         assert!(seed_lease_allowed(&seeders, first, 2));
         assert!(!seed_lease_allowed(&seeders, third, 2));
         assert!(seed_lease_allowed(&HashSet::new(), third, 2));
-    }
-}
-
-/// Do two addresses share an IPv4 address? (Peerlist SAME_IP flag, N1.)
-fn same_ip4(a: SocketAddr, b: SocketAddr) -> bool {
-    match (a, b) {
-        (SocketAddr::V4(x), SocketAddr::V4(y)) => x.ip() == y.ip(),
-        _ => false,
-    }
-}
-
-/// Is `addr` a globally reachable endpoint (not loopback, not RFC1918)?
-/// Loopback/private peers of the master are meaningless to a remote peer;
-/// they must not be advertised (or handshaken) across the internet.
-fn seed_lease_allowed(seeders: &HashSet<SocketAddr>, peer: SocketAddr, limit: usize) -> bool {
-    seeders.contains(&peer) || seeders.len() < limit
-}
-
-fn segment_number(name: &str) -> Option<u64> {
-    name.strip_prefix("seg_")?.strip_suffix(".ts")?.parse().ok()
-}
-
-pub fn remote_public(addr: SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_private(),
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unicast_link_local(),
     }
 }

@@ -220,7 +220,7 @@ pub fn run(
                         // the void (DEVLOG: home peer vs 127.0.0.1 entries).
                         let remote_me = node
                             .my_public
-                            .map(|a| crate::node::remote_public(a))
+                            .map(crate::node::remote_public)
                             .unwrap_or(false);
                         for (peer, flags) in peers {
                             if peer == local_addr || peer.port() == 0 {
@@ -289,7 +289,9 @@ pub fn run(
         // Discovered peers that didn't answer: drop, retried on next list.
         pending_handshakes.retain(|peer, deadline| {
             if now >= *deadline {
-                log::warn(&format!("no handshake reply from {peer} — removing stale source"));
+                log::warn(&format!(
+                    "no handshake reply from {peer} — removing stale source"
+                ));
                 node.peers.remove(peer);
                 false
             } else {
@@ -305,11 +307,11 @@ pub fn run(
             next_poll = now + MANIFEST_POLL_INTERVAL + jitter;
             poll_timeout = Some(now + MANIFEST_RESPONSE_TIMEOUT);
         }
-        if let Some(t) = poll_timeout {
-            if now >= t {
-                log::warn("manifest request timed out — will retry on next poll");
-                poll_timeout = None;
-            }
+        if let Some(t) = poll_timeout
+            && now >= t
+        {
+            log::warn("manifest request timed out — will retry on next poll");
+            poll_timeout = None;
         }
 
         if now >= next_peerlist {
@@ -343,6 +345,8 @@ pub fn run(
 }
 
 /// Collect finished downloads, then fill up to MAX_PARALLEL_DOWNLOADS slots.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn schedule_jobs(
     node: &mut Node,
     active: &mut HashMap<u16, ActiveJob>,
@@ -391,16 +395,8 @@ fn schedule_jobs(
         }
         v
     };
-    for (
-        id,
-        job,
-        outcome,
-        unresponsive,
-        not_found,
-        retryable_not_found,
-        latency,
-        bytes,
-    ) in finished {
+    for (id, job, outcome, unresponsive, not_found, retryable_not_found, latency, bytes) in finished
+    {
         active.remove(&id);
         if outcome.is_ok() {
             // Let the registry keep the receiver in grace (COMPLETE_GRACE)
@@ -440,10 +436,7 @@ fn schedule_jobs(
                     "segment {} temporarily unavailable from {}",
                     job.filename, job.peer
                 ));
-                retry_after.insert(
-                    (job.filename.clone(), job.peer),
-                    now + FAIL_RETRY_COOLDOWN,
-                );
+                retry_after.insert((job.filename.clone(), job.peer), now + FAIL_RETRY_COOLDOWN);
                 if let Some(tried_for) = tried.get_mut(&job.filename) {
                     tried_for.remove(&job.peer);
                 }
@@ -503,8 +496,7 @@ fn schedule_jobs(
             bootstrap,
             retry_after,
             rng,
-        )
-        else {
+        ) else {
             queue.push_front(filename);
             break;
         };
@@ -536,6 +528,7 @@ fn schedule_jobs(
 /// Choose a peer for the next pull: score-weighted (peer ranking, M5),
 /// least-loaded, not already tried for this job, peers slightly preferred
 /// over the bootstrap once their scores are comparable.
+#[allow(clippy::too_many_arguments)]
 fn pick_peer(
     node: &Node,
     active: &HashMap<u16, ActiveJob>,
@@ -661,10 +654,7 @@ where
     // a NOT_FOUND trial. Unknown peers remain useful for segments outside the
     // origin's inventory window, or while the origin's inventory is stale.
     if availability(bootstrap) == Some(true) {
-        candidates
-            .into_iter()
-            .filter(|p| *p == bootstrap)
-            .collect()
+        candidates.into_iter().filter(|p| *p == bootstrap).collect()
     } else {
         candidates
     }
@@ -677,11 +667,7 @@ fn is_bootstrap_recovery_candidate(
     not_tried: bool,
     manifest_authoritative: bool,
 ) -> bool {
-    bootstrap_known
-        && !cooling
-        && !inflight_limit_reached
-        && not_tried
-        && manifest_authoritative
+    bootstrap_known && !cooling && !inflight_limit_reached && not_tried && manifest_authoritative
 }
 
 fn write_manifest(data_dir: &Path, data: &[u8]) -> io::Result<bool> {
@@ -723,69 +709,6 @@ fn refresh_playback_manifest(data_dir: &Path, holdback_segments: usize) -> io::R
     fs::rename(tmp, playback)
 }
 
-/// Enqueue manifest segments that are missing locally and not already
-/// queued/in-flight and not in the failure cooldown.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn advertised_peer_replaces_master_as_source() {
-        let master = "127.0.0.1:3333".parse().unwrap();
-        let peer = "127.0.0.1:4444".parse().unwrap();
-        let candidates = vec![master, peer];
-        let selected = prefer_advertised_peers(candidates, master, |addr| {
-            (addr == peer).then_some(true)
-        });
-        assert_eq!(selected, vec![peer]);
-    }
-
-    #[test]
-    fn master_remains_fallback_without_advertised_peer() {
-        let master = "127.0.0.1:3333".parse().unwrap();
-        let peer = "127.0.0.1:4444".parse().unwrap();
-        let candidates = vec![master, peer];
-        let selected = prefer_advertised_peers(candidates.clone(), master, |_| None);
-        assert_eq!(selected, candidates);
-    }
-
-    #[test]
-    fn unknown_peer_does_not_compete_with_positive_master() {
-        let master = "127.0.0.1:3333".parse().unwrap();
-        let peer = "127.0.0.1:4444".parse().unwrap();
-        let selected = prefer_advertised_peers(vec![master, peer], master, |addr| {
-            (addr == master).then_some(true)
-        });
-        assert_eq!(selected, vec![master]);
-    }
-
-    #[test]
-    fn bootstrap_manifest_remains_recovery_source_when_inventory_lags() {
-        assert!(is_bootstrap_recovery_candidate(true, false, false, true, true));
-        assert!(!is_bootstrap_recovery_candidate(true, true, false, true, true));
-    }
-
-    #[test]
-    fn sync_queue_discards_jobs_outside_current_live_window() {
-        let root = std::env::temp_dir().join(format!(
-            "qstream-sync-queue-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let manifest = b"#EXTM3U\nseg_20.ts\nseg_21.ts\n";
-        let mut queue = VecDeque::from(["seg_1.ts".to_string(), "seg_20.ts".to_string()]);
-        let mut queued = HashSet::from([
-            "seg_1.ts".to_string(),
-            "seg_20.ts".to_string(),
-            "seg_99.ts".to_string(),
-        ]);
-        sync_queue(&root, manifest, &mut queue, &mut queued, &HashMap::new());
-        assert_eq!(queue, VecDeque::from(["seg_21.ts".to_string(), "seg_20.ts".to_string()]));
-        assert_eq!(queued, HashSet::from(["seg_20.ts".to_string(), "seg_21.ts".to_string()]));
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
 fn sync_queue(
     data_dir: &Path,
     manifest: &[u8],
@@ -824,5 +747,74 @@ fn sync_queue(
         // segments roll off anyway (DEVLOG: oldest-first left the peer far
         // behind the edge, 404 storm for the player).
         queue.push_front(filename);
+    }
+}
+
+/// Enqueue manifest segments that are missing locally and not already
+/// queued/in-flight and not in the failure cooldown.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_peer_replaces_master_as_source() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let candidates = vec![master, peer];
+        let selected =
+            prefer_advertised_peers(candidates, master, |addr| (addr == peer).then_some(true));
+        assert_eq!(selected, vec![peer]);
+    }
+
+    #[test]
+    fn master_remains_fallback_without_advertised_peer() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let candidates = vec![master, peer];
+        let selected = prefer_advertised_peers(candidates.clone(), master, |_| None);
+        assert_eq!(selected, candidates);
+    }
+
+    #[test]
+    fn unknown_peer_does_not_compete_with_positive_master() {
+        let master = "127.0.0.1:3333".parse().unwrap();
+        let peer = "127.0.0.1:4444".parse().unwrap();
+        let selected = prefer_advertised_peers(vec![master, peer], master, |addr| {
+            (addr == master).then_some(true)
+        });
+        assert_eq!(selected, vec![master]);
+    }
+
+    #[test]
+    fn bootstrap_manifest_remains_recovery_source_when_inventory_lags() {
+        assert!(is_bootstrap_recovery_candidate(
+            true, false, false, true, true
+        ));
+        assert!(!is_bootstrap_recovery_candidate(
+            true, true, false, true, true
+        ));
+    }
+
+    #[test]
+    fn sync_queue_discards_jobs_outside_current_live_window() {
+        let root = std::env::temp_dir().join(format!("qstream-sync-queue-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = b"#EXTM3U\nseg_20.ts\nseg_21.ts\n";
+        let mut queue = VecDeque::from(["seg_1.ts".to_string(), "seg_20.ts".to_string()]);
+        let mut queued = HashSet::from([
+            "seg_1.ts".to_string(),
+            "seg_20.ts".to_string(),
+            "seg_99.ts".to_string(),
+        ]);
+        sync_queue(&root, manifest, &mut queue, &mut queued, &HashMap::new());
+        assert_eq!(
+            queue,
+            VecDeque::from(["seg_21.ts".to_string(), "seg_20.ts".to_string()])
+        );
+        assert_eq!(
+            queued,
+            HashSet::from(["seg_20.ts".to_string(), "seg_21.ts".to_string()])
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

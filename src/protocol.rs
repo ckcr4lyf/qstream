@@ -501,7 +501,7 @@ fn encode_peers(peers: &[(SocketAddr, u8)]) -> Vec<u8> {
 
 /// Decode packed peer entries; skips malformed ones (port 0, IPv6).
 fn decode_peers(payload: &[u8]) -> Result<Vec<(SocketAddr, u8)>, ProtocolError> {
-    if payload.len() % 7 != 0 {
+    if !payload.len().is_multiple_of(7) {
         return Err(ProtocolError::BadPeerlistPayload { len: payload.len() });
     }
     let mut peers = Vec::new();

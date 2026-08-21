@@ -14,12 +14,7 @@ use crate::http;
 use crate::log;
 use crate::node::{Node, StatsSnapshot};
 
-pub fn run(
-    port: u16,
-    manifest_path: &str,
-    name: &str,
-    http_port: Option<u16>,
-) -> io::Result<()> {
+pub fn run(port: u16, manifest_path: &str, name: &str, http_port: Option<u16>) -> io::Result<()> {
     let manifest_path = PathBuf::from(manifest_path);
     if !manifest_path.is_file() {
         log::error(&format!(
@@ -34,8 +29,13 @@ pub fn run(
         .to_path_buf();
 
     let socket = UdpSocket::bind(("0.0.0.0", port))?;
-    log::info(&format!("master listening on 0.0.0.0:{port} (name: {name})"));
-    log::info(&format!("serving manifest from {}", manifest_path.display()));
+    log::info(&format!(
+        "master listening on 0.0.0.0:{port} (name: {name})"
+    ));
+    log::info(&format!(
+        "serving manifest from {}",
+        manifest_path.display()
+    ));
     log::info(&format!("serving segments from {}", segment_root.display()));
 
     if let Some(hp) = http_port {
@@ -93,8 +93,8 @@ fn run_loop(node: &mut Node, buf: &mut [u8; 65536]) -> io::Result<()> {
                 node.handle(&buf[..n], src);
             }
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => {}
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
             Err(e) => return Err(e),
         }
 

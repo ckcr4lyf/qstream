@@ -87,62 +87,62 @@ fn handle_connection(
         .trim_start_matches('/');
 
     // M5: live stats routes.
-    if name == "peers" {
-        if let Some(stats) = stats {
-            let body = stats.lock().map(|g| g.lines.join("\n")).unwrap_or_default();
-            let body = if body.is_empty() {
-                "node stats not ready\n".to_string()
-            } else {
-                format!("{body}\n")
-            };
-            respond(
-                &mut stream,
-                200,
-                "OK",
-                "text/plain",
-                body.as_bytes(),
-                head_only,
-            );
-            return;
-        }
+    if name == "peers"
+        && let Some(stats) = stats
+    {
+        let body = stats.lock().map(|g| g.lines.join("\n")).unwrap_or_default();
+        let body = if body.is_empty() {
+            "node stats not ready\n".to_string()
+        } else {
+            format!("{body}\n")
+        };
+        respond(
+            &mut stream,
+            200,
+            "OK",
+            "text/plain",
+            body.as_bytes(),
+            head_only,
+        );
+        return;
     }
-    if name == "stats" {
-        if let Some(stats) = stats {
-            let body = stats.lock().map(|g| g.json.clone()).unwrap_or_default();
-            let body = if body.is_empty() {
-                "{}".to_string()
-            } else {
-                format!("{body}\n")
-            };
-            respond(
-                &mut stream,
-                200,
-                "OK",
-                "application/json",
-                body.as_bytes(),
-                head_only,
-            );
-            return;
-        }
+    if name == "stats"
+        && let Some(stats) = stats
+    {
+        let body = stats.lock().map(|g| g.json.clone()).unwrap_or_default();
+        let body = if body.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{body}\n")
+        };
+        respond(
+            &mut stream,
+            200,
+            "OK",
+            "application/json",
+            body.as_bytes(),
+            head_only,
+        );
+        return;
     }
-    if name == "metrics" {
-        if let Some(stats) = stats {
-            let body = stats.lock().map(|g| g.metrics.clone()).unwrap_or_default();
-            let body = if body.is_empty() {
-                String::new()
-            } else {
-                format!("{body}\n")
-            };
-            respond(
-                &mut stream,
-                200,
-                "OK",
-                "text/plain; version=0.0.4",
-                body.as_bytes(),
-                head_only,
-            );
-            return;
-        }
+    if name == "metrics"
+        && let Some(stats) = stats
+    {
+        let body = stats.lock().map(|g| g.metrics.clone()).unwrap_or_default();
+        let body = if body.is_empty() {
+            String::new()
+        } else {
+            format!("{body}\n")
+        };
+        respond(
+            &mut stream,
+            200,
+            "OK",
+            "text/plain; version=0.0.4",
+            body.as_bytes(),
+            head_only,
+        );
+        return;
     }
     if name == "health" {
         respond(&mut stream, 200, "OK", "text/plain", b"ok\n", head_only);

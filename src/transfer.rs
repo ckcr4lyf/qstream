@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::fault::FaultInjector;
 use crate::log;
-use crate::protocol::{self, AckType, Message, SegmentAvailability, AVAILABILITY_MASK_BITS};
+use crate::protocol::{self, AVAILABILITY_MASK_BITS, AckType, Message, SegmentAvailability};
 
 pub const SEGMENT_PACKET_SIZE: usize = 1400;
 pub const INITIAL_WINDOW: u16 = 5;
@@ -193,25 +193,24 @@ impl SenderTransfer {
         }
 
         // Ack timer: the window was fully sent but no ACK arrived.
-        if self.range_sent >= count {
-            if let Some(ack) = self.ack_deadline {
-                if now >= ack {
-                    self.retry_count += 1;
-                    if self.retry_count > SENDER_RETRY_LIMIT {
-                        return Err(format!(
-                            "sender {:#06x}: no ACK for range {:?} after {SENDER_RETRY_LIMIT} retries",
-                            self.transfer_id, self.range
-                        ));
-                    }
-                    log::debug(&format!(
-                        "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{SENDER_RETRY_LIMIT})",
-                        self.transfer_id, self.range, self.retry_count
-                    ));
-                    self.range_sent = 0;
-                    self.ack_deadline = None;
-                    self.send_deadline = now;
-                }
+        if self.range_sent >= count
+            && let Some(ack) = self.ack_deadline
+            && now >= ack
+        {
+            self.retry_count += 1;
+            if self.retry_count > SENDER_RETRY_LIMIT {
+                return Err(format!(
+                    "sender {:#06x}: no ACK for range {:?} after {SENDER_RETRY_LIMIT} retries",
+                    self.transfer_id, self.range
+                ));
             }
+            log::debug(&format!(
+                "sender {:#06x}: ack timeout, resending range {:?} (retry {}/{SENDER_RETRY_LIMIT})",
+                self.transfer_id, self.range, self.retry_count
+            ));
+            self.range_sent = 0;
+            self.ack_deadline = None;
+            self.send_deadline = now;
         }
         Ok(())
     }
@@ -488,7 +487,7 @@ impl ReceiverTransfer {
     ) {
         let next_start = start as u32 + count as u32;
         let remaining = total as u32 - next_start + 1;
-        if remaining <= 0 {
+        if remaining == 0 {
             self.complete(socket, fault);
             return;
         }
@@ -534,11 +533,11 @@ impl ReceiverTransfer {
         }
 
         let dt = self.started_at.elapsed().as_millis();
-        let kbps = if dt > 0 {
-            (final_size as u128 * 1000 / dt) / 1024
-        } else {
-            0
-        };
+        let kbps = (final_size as u128)
+            .checked_mul(1000)
+            .and_then(|bytes| bytes.checked_div(dt))
+            .map(|bytes| bytes / 1024)
+            .unwrap_or(0);
         self.saved_bytes = Some(final_size as u64);
         log::info(&format!(
             "downloaded {} ({} bytes, {} packets, {}ms, {} KB/s)",
@@ -593,22 +592,22 @@ impl ReceiverTransfer {
             self.backoff = (self.backoff + 1).min(4);
             self.quiet_deadline = now + adaptive_quiet(self.gap_est, self.backoff);
             acted = true;
-            if let Some((start, count)) = self.range {
-                if !self.range_complete(start, count) {
-                    self.retry_count += 1;
-                    if self.retry_count > RETRY_LIMIT {
-                        self.fail(format!(
-                            "range ({start},{count}) of {} incomplete after {RETRY_LIMIT} retries",
-                            self.filename
-                        ));
-                        return;
-                    }
-                    log::debug(&format!(
-                        "receiver {:#06x}: re-requesting range ({start},{count}) (retry {}/{RETRY_LIMIT})",
-                        self.transfer_id, self.retry_count
+            if let Some((start, count)) = self.range
+                && !self.range_complete(start, count)
+            {
+                self.retry_count += 1;
+                if self.retry_count > RETRY_LIMIT {
+                    self.fail(format!(
+                        "range ({start},{count}) of {} incomplete after {RETRY_LIMIT} retries",
+                        self.filename
                     ));
-                    self.send_ack(socket, fault, (start, count));
+                    return;
                 }
+                log::debug(&format!(
+                    "receiver {:#06x}: re-requesting range ({start},{count}) (retry {}/{RETRY_LIMIT})",
+                    self.transfer_id, self.retry_count
+                ));
+                self.send_ack(socket, fault, (start, count));
             }
         }
         if acted {
@@ -793,6 +792,7 @@ impl TransferRegistry {
         Some(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn on_content(
         &mut self,
         socket: &UdpSocket,
@@ -827,10 +827,7 @@ impl TransferRegistry {
                 log::info(&format!(
                     "transfer {transfer_id:#06x} complete — sender freed"
                 ));
-                self.events.push(RegEvent::Served {
-                    src: remote,
-                    bytes,
-                });
+                self.events.push(RegEvent::Served { src: remote, bytes });
                 self.senders.remove(&transfer_id);
             }
         } else {

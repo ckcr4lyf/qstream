@@ -110,7 +110,12 @@ impl FaultInjector {
     pub fn summary(&self) -> String {
         format!(
             "fault injection: drop {}% dup {}% delay {}ms reorder {}% burst {}/{}ms seed rng",
-            self.drop_pct, self.dup_pct, self.delay_ms, self.reorder_pct, self.burst_dur_ms, self.burst_every_ms
+            self.drop_pct,
+            self.dup_pct,
+            self.delay_ms,
+            self.reorder_pct,
+            self.burst_dur_ms,
+            self.burst_every_ms
         )
     }
 
@@ -134,8 +139,11 @@ impl FaultInjector {
                 continue;
             }
             if self.delay_ms > 0 {
-                self.delayed
-                    .push_back((now + Duration::from_millis(self.delay_ms), bytes.clone(), dst));
+                self.delayed.push_back((
+                    now + Duration::from_millis(self.delay_ms),
+                    bytes.clone(),
+                    dst,
+                ));
             } else {
                 if socket.send_to(&bytes, dst).is_ok() {
                     self.stats.emitted += 1;
@@ -195,12 +203,13 @@ impl FaultInjector {
             .front()
             .map(|(t, _, _)| *t)
             .or_else(|| self.held.as_ref().map(|(t, _, _)| *t + HOLD_MAX));
-        if let Some(t) = d {
-            // Never return a deadline in the past; the loop clamps anyway.
-            Some(if t > now { t } else { now + Duration::from_nanos(1) })
-        } else {
-            None
-        }
+        d.map(|t| {
+            if t > now {
+                t
+            } else {
+                now + Duration::from_nanos(1)
+            }
+        })
     }
 }
 
@@ -224,8 +233,8 @@ mod tests {
             let v = r.next() % 100;
             assert!(v < 100);
         }
-        assert!(r.roll(0) == false);
-        assert!(r.roll(100) == true);
+        assert!(!r.roll(0));
+        assert!(r.roll(100));
     }
 
     #[test]

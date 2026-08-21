@@ -25,7 +25,9 @@ pub fn try_map(port: u16) -> Option<SocketAddr> {
     let control_url = discover_control_url()?;
     let external_ip = get_external_ip(&control_url)?;
     if add_port_mapping(&control_url, port)? {
-        log::info(&format!("UPnP: mapped UDP {port} -> {port} ({external_ip})"));
+        log::info(&format!(
+            "UPnP: mapped UDP {port} -> {port} ({external_ip})"
+        ));
         Some(SocketAddr::new(IpAddr::V4(external_ip), port))
     } else {
         None
@@ -51,17 +53,12 @@ fn discover_control_url() -> Option<String> {
     let mut buf = [0u8; 8192];
     let mut locations: Vec<String> = Vec::new();
     // Collect responses until the timeout; keep the LOCATION headers.
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                let text = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-                for line in text.lines() {
-                    if let Some(v) = line.strip_prefix("location:") {
-                        locations.push(v.trim().to_string());
-                    }
-                }
+    while let Ok((n, _)) = socket.recv_from(&mut buf) {
+        let text = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("location:") {
+                locations.push(v.trim().to_string());
             }
-            Err(_) => break, // read timeout: enough
         }
     }
     for location in locations {
@@ -95,7 +92,7 @@ fn device_control_url(location: &str) -> Option<String> {
     if control.starts_with("http://") {
         Some(control)
     } else {
-        let base = location.trim_end_matches(|c| c == '/');
+        let base = location.trim_end_matches('/');
         if control.starts_with('/') {
             let scheme_end = base.find("://")?;
             let host_end = base[scheme_end + 3..].find('/').map(|i| scheme_end + 3 + i);
@@ -156,9 +153,7 @@ fn soap_call(control_url: &str, action: &str, args: &str) -> Option<String> {
     );
 
     let mut stream = TcpStream::connect(&host).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
@@ -167,13 +162,9 @@ fn soap_call(control_url: &str, action: &str, args: &str) -> Option<String> {
 
 /// Minimal HTTP/1.1 GET returning the raw response.
 fn http_get(host: &str, path: &str) -> Option<String> {
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
-    let mut stream = TcpStream::connect(&host).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .ok()?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let mut stream = TcpStream::connect(host).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
@@ -225,7 +216,10 @@ mod tests {
     #[test]
     fn tag_extraction() {
         let xml = "<s:Envelope><s:Body><NewExternalIPAddress>203.0.113.9</NewExternalIPAddress></s:Body></s:Envelope>";
-        assert_eq!(tag_text(xml, "NewExternalIPAddress"), Some("203.0.113.9".into()));
+        assert_eq!(
+            tag_text(xml, "NewExternalIPAddress"),
+            Some("203.0.113.9".into())
+        );
         assert_eq!(tag_text(xml, "Missing"), None);
     }
 
