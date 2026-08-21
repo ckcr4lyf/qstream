@@ -1,17 +1,22 @@
-# qstream — NAT traversal plan (milestone N)
+# qstream — NAT traversal (milestone N)
 
 Date: 2025-08-15 · Status: N1-N4 implemented and lab-verified (see DEVLOG); N6 remains
 Scope: keep the swarm working when most peers are ordinary home clients
 behind NAT. At least the master is publicly reachable (VPS).
 
+This document covers the implemented connectivity ladder and the remaining
+relay design. The current binary implements endpoint observation, PING/PONG
+keep-alives and punching, same-LAN beacons, and opportunistic UPnP-IGD
+mapping. It does **not** implement relay forwarding.
+
 ---
 
 ## 1. The problem
 
-Today the swarm assumes peers have directly reachable UDP endpoints (LAN /
-fixed-IP). A home client is behind a NAT box: inbound UDP is blocked unless
-the client opened the path first. We need every peer to be able to pull
-segments from (and serve to) any other peer regardless of NAT type.
+A home client is behind a NAT box: inbound UDP is blocked unless the client
+opened the path first. The implemented path maintenance handles common cone
+and restricted NATs, but not every NAT type; a relay is still needed for
+symmetric-NAT pairs with no stable endpoint.
 
 The good news: **our transfers are receiver-driven** — the receiver sends
 `SEGMENT_REQUEST` and the sender only replies. That means the *receiver's*
@@ -71,15 +76,18 @@ free (every 2-5 s).
 
 ### 4.1 Endpoint discovery & reachability (in-band, no STUN)
 
-- The master already sees every peer's **observed public endpoint** (the
-  source address of its packets). It reports each peer's observed endpoint
-  in the peerlist — this is a built-in STUN "mapped address".
-- The handshake payload gains a peer's **claimed endpoint** (from UPnP, if
-  any) + a reachability self-report: `public | upnp | nat`.
-- The master cross-checks: if a peer's observed endpoint equals its claimed
-  mapping, the mapping works (verified). The master can also probe a peer
-  with PING and mark it reachable/unreachable in the peerlist.
-- Peers learn "my public endpoint" from the handshake response.
+- The master sees every peer's **observed public endpoint** (the source
+  address of its packets) and returns it in the handshake response. This is
+  an in-band STUN-like mapped address.
+- The handshake request carries a 6-byte claimed endpoint from UPnP, or
+  `0.0.0.0:0` when there is no mapping. The master cross-checks the claim
+  against the observed source and marks matching entries with
+  `PEER_UPNP_MAPPED`.
+- Peerlist entries carry a 1-byte flags field: `PEER_UPNP_MAPPED`,
+  `PEER_SAME_IP`, and additive `PEER_PARENT`. Reachability freshness is
+  tracked locally from PONGs rather than encoded as a separate peerlist
+  capability.
+- Peers learn their observed endpoint from the handshake response.
 
 ### 4.2 PING / PONG — one mechanism, three jobs
 
@@ -94,11 +102,11 @@ endpoint; PONG replies. This serves as:
 3. **Liveness** — replaces the unresponsive-timeout heuristic for peers we
    haven't transferred with recently.
 
-Punching strategy: when a peer needs a path to another peer and doesn't
-have a fresh PONG, it PINGs in bursts (e.g., 5 × 500 ms) — matching typical
-NAT behavior and giving simultaneous-open a chance to land on both sides.
-Both sides do this on their own; the peerlist is the endpoint exchange, so
-no master coordination message is strictly required.
+The implementation sends PINGs every 10 seconds to known peers. This keeps
+mappings alive and provides the simultaneous-open packet used for direct
+punching; a received PONG marks the path fresh for 30 seconds. Both sides
+maintain this behavior independently, so no extra master coordination message
+is required.
 
 ### 4.3 Receiver-driven pulls (already our design — keep it)
 
@@ -112,14 +120,12 @@ source address. Two consequences to preserve:
 
 ### 4.4 Same-LAN shortcut
 
-- Master marks peerlist entries with `same_public_ip` (both peers' observed
-  endpoints share an IP → likely the same NAT/LAN).
-- Handshake carries the peer's **private port** (its bound port). Same-LAN
-  peers try direct private endpoints first (guessing the private IP is the
-  gap — see Risks).
-- Optional future: a **LAN beacon** — a periodic UDP broadcast
-  (`255.255.255.255:<port>`) carrying name+port so same-LAN peers discover
-  each other's private IPs without any guessing. std-only, ~30 lines.
+- The master marks peerlist entries with `PEER_SAME_IP` when observed IPv4
+  endpoints share an address.
+- Peers also broadcast a PING with a per-node nonce to
+  `255.255.255.255:<local-port>` every five seconds. A peer receiving a
+  private-source beacon registers that endpoint as a LAN path and prefers it
+  over a public hairpin path. The nonce prevents self-discovery.
 
 ### 4.5 UPnP-IGD port mapping (std-only)
 
@@ -169,14 +175,21 @@ a later nicety).
 
 ## 5. Protocol v3 changes
 
-- Version byte 0x02 → 0x03 (both ends updated together; old versions
-  rejected cleanly with a version-mismatch note).
-- Handshake request/response payload: name + flags + private port +
-  claimed endpoint (compact fixed layout, ~16 B).
-- Peerlist entry: 6 B ip:port + 1 B flags (reachability: public/upnp/nat,
-  same_public_ip bit) → 7 B per entry.
-- New messages: `PING 0x60`, `PONG 0x61`, `RELAY_DATA 0x63`.
-- `RELAY_DATA` payload: target (6 B) + inner full datagram (header+body).
+Implemented protocol v3 changes:
+
+- Version byte `0x02` → `0x03`; old versions are rejected cleanly.
+- Handshake request/response payloads are 6-byte endpoint + UTF-8 display
+  name. Requests carry the claimed endpoint; responses carry the observed
+  endpoint.
+- Peerlist entries are 7 bytes: IPv4 address, port, and flags
+  (`PEER_UPNP_MAPPED`, `PEER_SAME_IP`, or `PEER_PARENT`).
+- `PING 0x60` carries a 4-byte nonce plus display name; `PONG 0x61` is empty
+  or carries the optional 10-byte recent inventory.
+- `SEGMENT_NOT_FOUND` can carry the same inventory and the additive
+  `SEGMENT_NOT_READY` flag for temporary origin admission denials.
+
+The proposed `RELAY_DATA 0x63` envelope remains unimplemented and is not part
+of the current message catalog.
 
 ## 6. Milestones
 

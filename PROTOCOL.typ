@@ -78,7 +78,7 @@
   #v(6pt)
   #text(size: 13.5pt)[Wire Protocol Specification]
   #v(4pt)
-  #text(size: 10.5pt, fill: gray)[Version 0.2 (Draft) — header, manifest request, piece request]
+  #text(size: 10.5pt, fill: gray)[Version 0.3 — current qstream wire protocol]
 ]
 
 #v(10pt)
@@ -87,7 +87,7 @@
 #align(center)[
   #text(size: 9pt, fill: gray)[
     Companion to `SPEC.md` (design & milestones). This document defines the
-    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — M0, M1, M2, M3, M4].
+    on-the-wire format. Status: #text(fill: rgb("#15803d"))[Implemented — protocol v3, M0–M5, N1–N4].
   ]
 ]
 
@@ -158,7 +158,7 @@ The header is fixed at #strong[14 bytes] and present in every message.
     strong([Offset]), strong([Size]), strong([Field]), strong([Description]),
   ),
   [0], [3], [magic], [#mono["QST"] (0x51 0x53 0x54). Rejects stray/garbage datagrams.],
-  [3], [1], [version], [Protocol version, currently #mono[0x02].],
+  [3], [1], [version], [Protocol version, currently #mono[0x03].],
   [4], [1], [message type], [One of the codes in section 4.],
   [5], [1], [flags], [ACK type for #mono[ACK] messages (#mono[0x00] progress, #mono[0x04] complete); else #mono[0x00].],
   [6], [2], [data length], [Payload length in bytes (0..=65535). Datagram = 14 + this.],
@@ -186,16 +186,18 @@ requester and echoed by the responder in every related datagram.
     rgb("#f1f5f9"),
     strong([Message]), strong([flags]), strong([transfer id]), strong([packet \#]), strong([total]), strong([payload]),
   ),
-  [HANDSHAKE_REQUEST], [—], [—], [—], [—], [node name (UTF-8)],
-  [HANDSHAKE_RESPONSE], [—], [—], [—], [—], [node name (UTF-8)],
+  [HANDSHAKE_REQUEST], [—], [—], [—], [—], [claimed endpoint (6 B) + display name (UTF-8)],
+  [HANDSHAKE_RESPONSE], [—], [—], [—], [—], [observed endpoint (6 B) + display name (UTF-8)],
   [MANIFEST_REQUEST], [—], [—], [—], [—], [—],
   [MANIFEST_RESPONSE], [—], [—], [—], [—], [m3u8 contents],
   [SEGMENT_REQUEST], [—], [#strong[✓] transfer], [—], [—], [filename (UTF-8)],
   [SEGMENT_CONTENTS], [—], [#strong[✓] transfer], [#strong[✓] index], [#strong[✓] N], [file chunk ≤ 1400 B],
-  [SEGMENT_NOT_FOUND], [—], [#strong[✓] transfer], [—], [—], [—],
+  [SEGMENT_NOT_FOUND], [#strong[✓] not-ready], [#strong[✓] transfer], [—], [—], [optional inventory (10 B)],
   [ACK], [#strong[✓] type], [#strong[✓] transfer], [—], [—], [next range (start, count) — see §6],
   [PEERLIST_REQUEST], [—], [—], [—], [—], [—],
-  [PEERLIST_RESPONSE], [—], [—], [—], [—], [packed ip:port entries (6 B each)],
+  [PEERLIST_RESPONSE], [—], [—], [—], [—], [packed ip:port + flags entries (7 B each)],
+  [PING], [—], [—], [—], [—], [nonce (4 B) + display name],
+  [PONG], [—], [—], [—], [—], [optional inventory (10 B)],
 )
 
 = Message catalog
@@ -209,18 +211,18 @@ requester and echoed by the responder in every related datagram.
     rgb("#f1f5f9"),
     strong([Code]), strong([Message]), strong([Direction]), strong([Status]), strong([Payload]),
   ),
-  [#hexcode[0x01]], [HANDSHAKE_REQUEST], [peer → master], [done (M0)], [node name (UTF-8)],
-  [#hexcode[0x02]], [HANDSHAKE_RESPONSE], [master → peer], [done (M0)], [node name (UTF-8)],
-  [#hexcode[0x10]], [PING], [any → any], [planned], [—],
-  [#hexcode[0x11]], [PONG], [any → any], [planned], [—],
-  [#hexcode[0x20]], [MANIFEST_REQUEST], [peer → master], [done (M1)], [—],
-  [#hexcode[0x21]], [MANIFEST_RESPONSE], [master → peer], [done (M1)], [m3u8 contents],
-  [#hexcode[0x30]], [SEGMENT_REQUEST], [any → any], [spec'd (M2)], [filename (UTF-8)],
-  [#hexcode[0x31]], [SEGMENT_CONTENTS], [any → any], [spec'd (M2)], [file chunk ≤ 1400 B],
-  [#hexcode[0x32]], [SEGMENT_NOT_FOUND], [any → any], [spec'd (M2)], [—],
-  [#hexcode[0x40]], [ACK], [any → any], [spec'd (M2)], [next range (start, count)],
-  [#hexcode[0x50]], [PEERLIST_REQUEST], [peer → any], [done (M3)], [—],
-  [#hexcode[0x51]], [PEERLIST_RESPONSE], [any → peer], [done (M3)], [packed ip:port entries],
+  [#hexcode[0x01]], [HANDSHAKE_REQUEST], [peer → node], [done], [6-byte claimed endpoint + display name],
+  [#hexcode[0x02]], [HANDSHAKE_RESPONSE], [node → peer], [done], [6-byte observed endpoint + display name],
+  [#hexcode[0x20]], [MANIFEST_REQUEST], [peer → bootstrap], [done], [—],
+  [#hexcode[0x21]], [MANIFEST_RESPONSE], [bootstrap → peer], [done], [m3u8 contents],
+  [#hexcode[0x30]], [SEGMENT_REQUEST], [any → any], [done], [filename (UTF-8)],
+  [#hexcode[0x31]], [SEGMENT_CONTENTS], [any → any], [done], [file chunk ≤ 1400 B],
+  [#hexcode[0x32]], [SEGMENT_NOT_FOUND], [any → any], [done], [optional inventory; flag 0x01 = temporary not-ready],
+  [#hexcode[0x40]], [ACK], [any → any], [done], [next range (start, count)],
+  [#hexcode[0x50]], [PEERLIST_REQUEST], [peer → any], [done], [—],
+  [#hexcode[0x51]], [PEERLIST_RESPONSE], [any → peer], [done], [packed ip:port + flags entries (7 B)],
+  [#hexcode[0x60]], [PING], [any → any], [done], [nonce (4 B) + display name],
+  [#hexcode[0x61]], [PONG], [any → any], [done], [optional inventory (10 B)],
 )
 
 = Manifest request (happy path)
@@ -238,7 +240,7 @@ is no session.
   inset: 4pt,
   ..thead(rgb("#f1f5f9"), strong([Message]), strong([Format])),
   [MANIFEST_REQUEST], [
-    #mono[51 53 54] (magic) · #mono[02] (version) · #mono[20] (type) ·
+    #mono[51 53 54] (magic) · #mono[03] (version) · #mono[20] (type) ·
     #mono[00] (flags) · #mono[00 00] (data length) ·
     #mono[00 00] (transfer id) · #mono[00 00] (packet \#) · #mono[00 00] (total)
     — 14 bytes, no payload.
@@ -247,7 +249,7 @@ is no session.
     Same header with type #mono[21] and `data length` = manifest size;
     payload = raw m3u8 bytes. Example for the playlist
     #mono[#text("#EXTM3U\\n")] (8 bytes):
-    #mono[51 53 54 02 21 00 00 08 00 00 00 00 00 00] then
+    #mono[51 53 54 03 21 00 00 08 00 00 00 00 00 00] then
     #mono[23 45 58 54 4D 33 55 0A].
   ],
 )
@@ -271,7 +273,7 @@ is no session.
 
 #emph[Failure handling.] If the master cannot read the manifest it replies
 with an empty payload (the peer keeps its previous copy). A timeout is
-retried on the next poll — the peer polls every 3 s by default.
+retried on the next poll — the peer polls on a staggered roughly 2 s cadence.
 
 = Piece (segment) request (happy path)
 
@@ -292,13 +294,13 @@ synchronization to lose (see `SPEC.md` §7). `INITIAL_WINDOW = 5`,
   [SEGMENT_REQUEST], [
     Type #mono[30]; `transfer id` = fresh random value; payload = filename.
     Example requesting #mono[seg_0042.ts] with transfer id #mono[0x01A7]:
-    #mono[51 53 54 02 30 00 00 0B 01 A7 00 00 00 00]
+    #mono[51 53 54 03 30 00 00 0B 01 A7 00 00 00 00]
     then #mono[73 65 67 5F 30 30 34 32 2E 74 73].
   ],
   [SEGMENT_CONTENTS], [
     Type #mono[31]; echoes `transfer id`; `packet number` = 1-based index;
     `total packets` = #mono[N]; payload = chunk of the file, ≤ 1400 bytes.
-    First packet of a 60-packet file: #mono[51 53 54 02 31 00 05 78 01 A7 00 01 00 3C]
+    First packet of a 60-packet file: #mono[51 53 54 03 31 00 05 78 01 A7 00 01 00 3C]
     followed by 1400 bytes of file data.
   ],
   [SEGMENT_NOT_FOUND], [
@@ -391,8 +393,8 @@ needs no handshake — serving is stateless.
   [#mono[MAX_WINDOW]], [64], [largest range size],
   [#mono[PACE_INTERVAL_MS]], [1], [sleep between packets (rate limiter)],
   [#mono[WINDOW_QUIET_MS]], [150], [receiver quiet period before ACKing],
-  [#mono[FIRST_RESPONSE_TIMEOUT_MS]], [2000], [give up if nothing arrives],
+  [#mono[FIRST_RESPONSE_TIMEOUT_MS]], [4000], [give up if nothing arrives; one resend at half timeout],
   [#mono[WINDOW_RETRY_LIMIT]], [8], [receiver re-request limit],
-  [#mono[ACK_RETRY_LIMIT]], [8], [sender resend limit],
-  [#mono[MAX_CONCURRENT_TRANSFERS]], [16], [per-node transfer registry bound],
+  [#mono[SENDER_RETRY_LIMIT]], [30], [sender resend limit],
+  [#mono[MAX_CONCURRENT_TRANSFERS]], [32], [per-node transfer registry bound],
 )

@@ -1,11 +1,12 @@
 # qstream — SPEC
 
 > Modern Rust rewrite of the `udp-file-transfer` P2P video streaming design.
-> Single static binary, no runtime dependencies. `std`-only for now.
+> Single binary, no runtime dependencies, `std`-only for now.
 >
-> Status: **v0.5 — M0 (handshake), M1 (manifest), M2 (segments), M3 (peer discovery), M4 (playback) implemented.**
-
----
+> Current status: **protocol v3; M0–M5 implemented; NAT traversal N1–N4
+> implemented and lab-verified.** This document describes the current design,
+> while [DEVLOG.md](DEVLOG.md) records implementation history and
+> [NAT.md](NAT.md) covers the NAT-specific design and remaining relay work.
 
 ## 1. Overview
 
@@ -16,47 +17,63 @@ fashion:
   + `.ts` segments) and serves it over UDP.
 - **Peers** discover each other, request segments over UDP, and re-serve the
   segments they have to other peers.
-- Every node exposes its local copy over HTTP so a player (`ffplay`, `mpv`,
+- Every node can expose its local copy over HTTP so a player (`ffplay`, `mpv`,
   browser HLS player) can consume it.
 
-UDP is lossy, unordered and unacknowledged. Reliability, ordering and flow
-control are implemented **in the protocol layer** (see §7).
+UDP is lossy, unordered and unacknowledged. Reliability, ordering, flow
+control, endpoint discovery, and NAT path maintenance are implemented above
+UDP. The protocol is deliberately plain and unauthenticated.
 
 Inherited design DNA from `udp-file-transfer` (TS): binary header, window-based
-flow control with ACKs, manifest polling, job queue with peer selection.
-We modernize: Rust, explicit state machines, tests, fault injection — and we
-fix the original's window-desync flaw (see §7) with receiver-driven windows.
+flow control with ACKs, manifest polling, and a job queue with peer selection.
+We modernize it with Rust, explicit state machines, tests, fault injection,
+NAT traversal, observability, and a fix for the original window-desync flaw:
+windows are receiver-driven.
 
-## 2. Goals / Non-goals
+## 2. Goals / non-goals
 
 ### Goals
+
 - Single binary; start as `server` (master/seed) or `peer` via subcommand.
 - Streaming over UDP with flow control tuned for real-time HLS delivery.
 - Peers share load: a peer can serve segments it has downloaded.
-- Correct-by-construction flow control: no sender/receiver window desync
-  under packet loss (see §7).
-- Deterministic, testable protocol codec (property/round-trip tests).
+- Correct-by-construction flow control under packet loss.
+- Deterministic, testable protocol codec.
+- Direct operation across common cone/restricted NATs and same-LAN peers,
+  using endpoint observation, PING/PONG hole punching, LAN beacons, and
+  opportunistic UPnP-IGD mapping.
+- Operational visibility through peer stats, JSON stats, and Prometheus
+  metrics.
 
-### Non-goals (for now)
-- NAT traversal / hole punching / DHT-style discovery (fixed IPs on a LAN).
-- Encryption/auth (plain UDP, trusting the network).
+### Non-goals (current)
+
+- Encryption, authentication, or authorization: the network is trusted by
+  assumption.
+- Relay fallback for symmetric-NAT pairs.
+- Master failover or high availability.
+- DHT-style discovery or an unbounded/full-mesh peer list.
 - Multicast.
 - Non-HLS sources (one live m3u8 stream per master).
+- General-purpose HTTP serving (the embedded server is a minimal playback and
+  inspection endpoint).
 
 ## 3. Terminology
 
-| Term      | Meaning                                                     |
-|-----------|-------------------------------------------------------------|
-| master    | Seed node that owns the source HLS stream and serves it     |
-| peer      | Node that downloads from master/peers and re-serves         |
-| manifest  | `live.m3u8` playlist listing current `.ts` segment files    |
-| segment   | One `.ts` chunk of the stream, transferred as a single file |
-| node      | Any running qstream instance (master or peer)               |
-| peer list | Set of known nodes; exchanged via PEERLIST messages         |
+| Term | Meaning |
+|---|---|
+| master | Seed node that owns the source HLS stream and serves it |
+| peer | Node that downloads from master/peers and re-serves segments |
+| manifest | `live.m3u8` playlist listing current `.ts` segment files |
+| segment | One `.ts` chunk of the stream, transferred as a single file |
+| node | Any running qstream instance, master or peer |
+| peer list | Bounded set of known nodes exchanged via PEERLIST messages |
+| inventory | Compact newest-first bitmap of a node's recent local segments |
+| parent | A low-load peer temporarily preferred by the master for replication |
+| origin seeder | A peer granted a per-segment lease to receive a normal origin copy |
 
 ## 4. Network model
 
-```
+```text
                   +----------+
    ffmpeg/HLS --> | master   |  UDP: manifest + segments
                   +----------+
@@ -66,381 +83,300 @@ fix the original's window-desync flaw (see §7) with receiver-driven windows.
                      |  v  |
                +-----+  +--+-----+
                | peer1 | | peer2  |  ...
-               +-----+  +--+-----+
+               +-----+ +---------+
                   |         |
              HTTP 1337   HTTP 1338
                   |         |
                 ffplay    ffplay
 ```
 
-- One master. Peers connect to master (or any known peer) to bootstrap.
-- Every node has **one UDP socket** it both listens and sends on.
-- Every node optionally exposes its folder over HTTP for playback.
+- One master. Peers connect to the configured bootstrap node (normally the
+  master, though a known peer can be used as the rendezvous source).
+- Every node has one UDP socket it both listens and sends on.
+- A node may expose its folder and operational endpoints over HTTP.
+- The master advertises at most 16 reachable peers in a peerlist response and
+  marks up to two as preferred parents. This bounds each response but does not
+  make discovery globally scalable.
 
-## 5. Wire protocol (v2)
+## 5. Wire protocol (v3)
 
 All integers are **big-endian** (network byte order). Every datagram is one
-message: fixed header + optional payload.
+message: fixed header plus optional payload. Old protocol versions are
+rejected; v3 is not wire-compatible with v2.
 
 ### 5.1 Header (14 bytes)
 
-| Offset | Size | Field         | Notes                             |
-|--------|------|---------------|-----------------------------------|
-| 0      | 3    | magic         | ASCII `QST` (`0x51 0x53 0x54`)   |
-| 3      | 1    | version       | protocol version, currently `0x02`|
-| 4      | 1    | message type  | see §5.2                           |
-| 5      | 1    | flags         | ACK type for ACK messages, else `0x00` |
-| 6      | 2    | data length   | payload length in bytes (0..=65535) |
-| 8      | 2    | transfer id   | transfer correlation; `0x0000` if unused |
-| 10     | 2    | packet number | 1-based packet index within a transfer |
-| 12     | 2    | total packets | total packets in a transfer        |
+| Offset | Size | Field | Notes |
+|---:|---:|---|---|
+| 0 | 3 | magic | ASCII `QST` (`0x51 0x53 0x54`) |
+| 3 | 1 | version | protocol version, currently `0x03` |
+| 4 | 1 | message type | see §5.2 |
+| 5 | 1 | flags | ACK subtype or `SEGMENT_NOT_READY`; otherwise `0x00` |
+| 6 | 2 | data length | Payload length in bytes (`0..=65535`) |
+| 8 | 2 | transfer id | Transfer correlation; `0x0000` if unused |
+| 10 | 2 | packet number | 1-based packet index within a transfer |
+| 12 | 2 | total packets | Total packets in a transfer |
 
-Datagrams whose magic/version don't match are dropped and logged.
-
-Header v2 (14 B) extends v1 (8 B) with `flags`, `transfer id`, `packet
-number` and `total packets` — needed to multiplex concurrent segments on one
-socket and to route packets of a transfer. (v2 was trimmed from 16 B during
-spec: 3-byte magic instead of 4, no reserved byte.)
+Datagrams whose magic/version do not match are dropped and logged. Header v3
+retains the 14-byte multiplexing layout introduced by the earlier transfer
+protocol.
 
 ### 5.2 Message catalog
 
-| Message              | Code | Direction        | Payload                        | Status     |
-|----------------------|------|------------------|--------------------------------|------------|
-| HANDSHAKE_REQUEST    | 0x01 | peer → master    | node name (UTF-8)              | ✅ done M0 |
-| HANDSHAKE_RESPONSE   | 0x02 | master → peer    | node name (UTF-8)              | ✅ done M0 |
-| PING                 | 0x10 | any → any        | —                              | ⏳ planned  |
-| PONG                 | 0x11 | any → any        | —                              | ⏳ planned  |
-| MANIFEST_REQUEST     | 0x20 | peer → master    | —                              | ✅ done M1 |
-| MANIFEST_RESPONSE    | 0x21 | master → peer    | m3u8 contents (raw bytes)      | ✅ done M1 |
-| SEGMENT_REQUEST      | 0x30 | any → any        | filename (UTF-8)                  | ✅ done M2 |
-| SEGMENT_CONTENTS     | 0x31 | any → any        | file chunk (≤1400 bytes)          | ✅ done M2 |
-| SEGMENT_NOT_FOUND    | 0x32 | any → any        | —                                 | ✅ done M2 |
-| ACK                  | 0x40 | any → any        | next range (u16 start, u16 count) or empty + `COMPLETE` flag | ✅ done M2 |
-| PEERLIST_REQUEST     | 0x50 | peer → any        | —                                 | ✅ done M3 |
-| PEERLIST_RESPONSE    | 0x51 | any → peer        | packed (ip:port) entries          | ✅ done M3 |
+| Message | Code | Direction | Payload | Status |
+|---|---:|---|---|---|
+| HANDSHAKE_REQUEST | `0x01` | peer → node | 6-byte claimed endpoint + UTF-8 display name | ✅ |
+| HANDSHAKE_RESPONSE | `0x02` | node → peer | 6-byte observed endpoint + UTF-8 display name | ✅ |
+| MANIFEST_REQUEST | `0x20` | peer → bootstrap | — | ✅ |
+| MANIFEST_RESPONSE | `0x21` | bootstrap → peer | raw m3u8 bytes | ✅ |
+| SEGMENT_REQUEST | `0x30` | any → any | filename (UTF-8) | ✅ |
+| SEGMENT_CONTENTS | `0x31` | any → any | file chunk (≤1400 bytes) | ✅ |
+| SEGMENT_NOT_FOUND | `0x32` | any → any | optional 10-byte inventory | ✅ |
+| ACK | `0x40` | any → any | next range, or empty COMPLETE | ✅ |
+| PEERLIST_REQUEST | `0x50` | peer → any | — | ✅ |
+| PEERLIST_RESPONSE | `0x51` | any → peer | packed 7-byte entries | ✅ |
+| PING | `0x60` | any → any | 4-byte nonce + UTF-8 display name | ✅ |
+| PONG | `0x61` | any → any | optional 10-byte inventory | ✅ |
 
-### 5.3 Handshake flow (M0)
+Peerlist entries contain IPv4 address, port, and flags:
 
-1. `peer` binds its UDP socket (fixed local port) and sends
-   `HANDSHAKE_REQUEST` with its node name to the master.
-2. `master` validates the header, records the sender `ip:port` + name in its
-   peer list, and replies `HANDSHAKE_RESPONSE` with its own name.
-3. `peer` awaits the response with a timeout (`HANDSHAKE_TIMEOUT_MS = 3000`).
-   Success ⇒ connected (exit 0 in CLI); timeout ⇒ error (exit 1).
+- `PEER_UPNP_MAPPED = 0x01`: the peer's claimed endpoint matched the endpoint
+  observed by the master.
+- `PEER_SAME_IP = 0x02`: the endpoint shares the requester's observed IPv4
+  address and is likely behind the same NAT.
+- `PEER_PARENT = 0x04`: the master assigned the peer as a preferred parent.
 
-A node that receives `HANDSHAKE_RESPONSE` for a request it never made is
-ignored/logged. Duplicate handshakes are idempotent (peer list is keyed by
-`SocketAddr`; name updates are allowed).
+`SEGMENT_NOT_READY = 0x01` is an additive `SEGMENT_NOT_FOUND` flag. It means
+that the origin's bounded seed admission temporarily denied the request; it is
+not a definitive absence and must be retried without ordinary NOT_FOUND
+accounting. An unflagged response means the responder lacks the file.
 
-### 5.4 Manifest exchange (M1)
+The optional inventory is `u64 newest segment number` followed by a `u16`
+newest-first mask. Bit 0 represents `newest`, bit 1 represents `newest - 1`,
+and so on through 16 recent positions. Inventory answers expire after 15
+seconds; unknown or out-of-window pieces remain trial candidates.
 
-1. After a successful handshake, the peer sends `MANIFEST_REQUEST` to the
-   master every `MANIFEST_POLL_INTERVAL_MS = 3000`.
-2. The master re-reads its manifest file from disk on every request (the live
-   playlist rolls) and replies `MANIFEST_RESPONSE` with the raw m3u8 bytes.
-3. The peer writes the response atomically (tmp + rename) to
-   `<data-dir>/live.m3u8`, keeping its local copy in sync.
-4. Empty response (master read failure) → peer keeps its previous copy and
-   logs a warning. Request timeout → warn and retry on the next poll.
+### 5.3 Handshake and endpoint observation
 
-There is no per-request retry inside a poll; the next poll (3s later) is the
-retry. A peer tracks the last manifest it wrote and only rewrites on change.
+1. A node binds its UDP socket and sends `HANDSHAKE_REQUEST` with its claimed
+   UPnP endpoint, or `0.0.0.0:0` when it has no mapping, plus its display name.
+2. The responder records the source `ip:port`, replies with
+   `HANDSHAKE_RESPONSE`, and includes that observed source endpoint.
+3. The requester records the observed endpoint as its public endpoint. It
+   continues retrying the bootstrap handshake in the background if a response
+   is lost.
 
-### 5.5 Segment transfer (M2)
+Names are display labels, not identities. Peer registries are keyed by public
+socket endpoint, so multiple nodes using the default name `peer` remain
+independent.
 
-A segment is transferred as one **transfer**, identified by a random
-`transfer id` chosen by the requester and echoed by the responder in every
-related datagram (content packets *and* ACKs). All datagrams for a transfer
-go to/from the node's fixed listening socket — there are no ephemeral
-sender sockets — so routing is purely by transfer id.
+### 5.4 Manifest exchange
 
-Messages:
+1. A peer sends `MANIFEST_REQUEST` to its bootstrap node on a staggered,
+   roughly two-second polling cadence.
+2. The responder re-reads its manifest file and replies with raw m3u8 bytes.
+3. The peer writes the response atomically to `<data-dir>/live.m3u8` and
+   reconciles its newest-first missing-segment queue with the current playlist.
+4. An empty response leaves the previous manifest in place. A request timeout
+   is retried on the next poll.
 
-- `SEGMENT_REQUEST` — payload: filename (UTF-8); `transfer id` = fresh random.
-- `SEGMENT_CONTENTS` — payload: a chunk of the file, ≤ `SEGMENT_PACKET_SIZE`
-  bytes; `packet number` = 1-based index; `total packets` = N.
-- `SEGMENT_NOT_FOUND` — responder lacks the file; transfer fails.
-- `ACK` — payload: next range `(start, count)` (see §7), or empty with
-  `flags = COMPLETE`.
+The peer derives `<data-dir>/playback.m3u8` from locally complete files. It
+filters out missing segments, advances media sequence appropriately, and holds
+back three complete local segments by default; this prevents player 404 storms
+at a lagging live edge.
 
-Packetization: a file of size S yields `N = max(1, ceil(S / 1400))` packets;
-all but the last are exactly 1400 bytes. An empty file yields one packet with
-a zero-length payload. Datagram size ≤ 14 + 1400 = 1414 bytes (MTU-safe).
+### 5.5 Segment transfer
 
-### 5.6 Peer discovery (M3)
+A segment is transferred as one transfer, identified by a fresh requester
+transfer ID echoed by the responder. All datagrams use the node's fixed UDP
+socket; routing is by transfer ID plus the participating socket.
 
-Discovery is rendezvous-style: the node you bootstrapped from is also your
-list source, and transfers between peers are stateless (no handshake
-required to serve a segment).
+- `SEGMENT_REQUEST`: filename payload and fresh transfer ID.
+- `SEGMENT_CONTENTS`: file chunk, packet number 1-based, total packet count.
+- `SEGMENT_NOT_FOUND`: absence or temporary origin admission denial.
+- `ACK`: next packet range `(u16 start, u16 count)`, or empty with
+  `flags = 0x04` (`COMPLETE`).
 
-1. Every peer polls its bootstrap node for `PEERLIST_REQUEST` every
-   `PEERLIST_POLL_INTERVAL_MS = 5000`.
-2. The responder replies `PEERLIST_RESPONSE` with **its own view** of peers
-   (handshaked + discovered), packed as 6-byte entries
-   (4-byte IPv4 octets + 2-byte big-endian port), excluding the requester.
-3. For each new peer, the requester sends `HANDSHAKE_REQUEST` (3 s timeout).
-   - Success ⇒ register in the peer registry (with name) — usable for pulls.
-   - Timeout ⇒ skip; retried on the next list.
-4. Handshakes are **mutual**: any handshake we receive also registers the
-   sender, so two peers that discover each other converge immediately
-   (peerlist dedup by `SocketAddr`).
+Packetization uses `N = max(1, ceil(size / 1400))` packets, with datagrams no
+larger than 1414 bytes. Empty files are represented by one zero-length packet.
+Filenames must be flat, printable ASCII names without `/`, `\\`, leading `.`,
+control characters, or spaces.
 
-Peer registry:
-- Entries are learned from handshakes (sent or received) and peerlists.
-- Idle entries are evicted after `PEER_TTL_MS = 600000` (10 min).
-- A peer that never answers a download is evicted immediately on job
-  failure (see §7.6).
+### 5.6 Discovery and NAT path maintenance
 
-Segment availability is **trial-based**: we don't track which peer has which
-segment; a failed request (`SEGMENT_NOT_FOUND` or timeout) just means "try
-the next peer".
+Peers poll their bootstrap for a bounded peer list and handshake with newly
+seen endpoints. Handshakes are mutual, and serving a segment requires no
+handshake after the endpoint is known.
+
+Every node PINGs known peers every 10 seconds. PING/PONG provides keep-alive,
+connectivity/liveness evidence, and a direct hole-punch packet. Peers also
+broadcast a PING beacon every five seconds to the local broadcast address on
+their UDP port; a private source discovered this way is marked as a LAN path
+and preferred over a public hairpin path. The beacon nonce prevents a node
+from registering its own broadcast echo.
+
+A peer opportunistically requests a UDP UPnP-IGD mapping at startup. The
+master verifies a claimed mapping when it matches the observed endpoint. No
+relay is implemented, so true symmetric-NAT pairs are not guaranteed to have
+a direct path; see [NAT.md](NAT.md).
 
 ## 6. Node states
 
+```text
+master: Listening -> Serving
+        (handshake, manifest, segment requests, HTTP until Ctrl-C)
+
+peer:   boot -> bootstrap handshake (with background retry)
+        -> manifest/discovery sync -> parallel segment scheduling
+        -> UDP serving + optional HTTP playback/metrics
 ```
-master:  Listening ──► Serving (handshake, manifest + segment requests,
-         HTTP playback until Ctrl-C)
 
-peer:    Idle ──► Handshaking ──► Synced ──► ManifestSync ──► SegmentSync
-         (poll manifest,          (download missing segments in parallel,
-         write local copy)         discover peers via peerlists, serve own
-                                   copy over UDP + HTTP)
-```
+## 7. Reliability, scheduling, and flow control
 
-## 7. Reliability & flow control (M2)
+### 7.1 Receiver-driven windows
 
-Implemented as described below (state machines live in `src/transfer.rs`;
-both nodes multiplex transfers on one socket via the event loop in
-`src/node.rs`).
+The receiver owns the window and explicitly names the next packet range.
+Initially it requests `(1, min(5, N))`; after a complete range it doubles the
+count up to 64. It deduplicates packets, assembles them out of order, writes
+atomically, sends COMPLETE, and remains in a four-second grace period to
+re-ACK a lost final acknowledgement.
 
-Reliability is **receiver-driven**. The receiver owns the window: it
-explicitly names the next packet range it wants. This eliminates the
-window-size desync that plagued the original design, where both sides
-guessed the window size independently and diverged whenever an ACK was lost.
+A quiet receiver re-sends the current range. The sender retransmits its last
+range when its adaptive ACK timer expires. This converges under content loss,
+ACK loss, duplicates, reordering, and burst loss, but retransmission is of the
+whole current range rather than individual missing packets.
 
-### 7.1 Receiver (per transfer)
+### 7.2 Adaptive timers and pacing
 
-State: `have` (set of received packet numbers), `current = (start, count)`
-(the range it is asking for), `retry_count`, timers.
+The base settings are:
 
-1. Send `SEGMENT_REQUEST`.
-2. On the first `SEGMENT_CONTENTS`: learn `N = total packets`; request
-   `current = (1, min(INITIAL_WINDOW, N))` via `ACK`.
-3. On content packets: dedup into `have`.
-   - Range complete (all `count` packets of `current` present):
-     - all N packets present → assemble file, write atomically
-       (tmp + rename), send `ACK(COMPLETE)`, keep the transfer in a short
-       COMPLETE grace so a late duplicate re-triggers `ACK(COMPLETE)`.
-     - else → `current = (start+count, min(2*count, MAX_WINDOW, N))`;
-       send `ACK` with the new range; reset `retry_count`.
-4. Quiet period (`WINDOW_QUIET_MS` with no new packets):
-   - range incomplete → re-send the same `ACK` (retransmit request);
-     `retry_count++`; fail after `WINDOW_RETRY_LIMIT`.
-   - range complete → our previous ACK was lost → re-send it (nudge).
-5. No packets at all within `FIRST_RESPONSE_TIMEOUT_MS` → fail.
-6. `SEGMENT_NOT_FOUND` → fail.
+| Setting | Value |
+|---|---:|
+| `SEGMENT_PACKET_SIZE` | 1400 bytes |
+| `INITIAL_WINDOW` | 5 |
+| `MAX_WINDOW` | 64 |
+| `QSTREAM_PACING_MS` | 1 |
+| `QSTREAM_QUIET_MS` | 150 |
+| `QSTREAM_FIRST_TIMEOUT_MS` | 4000 |
+| receiver retry limit | 8 |
+| sender retry limit | 30 |
+| complete grace | 4000 ms |
+| transfer registry bound | 32 active transfers |
+| peer list response bound | 16 peers |
+| parent assignments | up to 2 peers |
+| parallel downloads | 4 |
+| in-flight pulls per peer | 2 |
 
-Window growth `count → min(2*count, MAX_WINDOW)` is slow-start: the window
-doubles per successfully completed range up to the cap.
+Receiver quiet periods use the observed inter-packet-gap EWMA and exponential
+backoff, capped at eight seconds. Sender ACK timers use a measured RTT EWMA,
+exponential backoff, and the longer 30-retry budget. If no first packet arrives
+by half the first-response timeout, the request is resent once.
 
-### 7.2 Sender (per transfer)
+### 7.3 Fault injection
 
-State: `file`, `N`, `last_range = (start, count)`, `retry_count`.
+The `FaultInjector` applies seeded drop, duplicate, delay, reorder, and periodic
+burst faults to all outgoing datagrams, including control messages. This is
+used by the lab scripts to test real protocol behavior rather than only data
+packets.
 
-1. On `SEGMENT_REQUEST`: read the file; if missing → `SEGMENT_NOT_FOUND`.
-2. On `ACK(range)`: clamp `count` to remaining packets; `last_range = range`;
-   send it (paced); reset `retry_count`; arm the ack timer.
-3. On `ACK(COMPLETE)`: free transfer state.
-4. Ack timer (`ACK_TIMEOUT_MS = count * PACE_INTERVAL_MS + WINDOW_QUIET_MS
-   + 100`, min 300 ms): resend `last_range` (receiver dedups);
-   `retry_count++`; fail after `ACK_RETRY_LIMIT`.
+### 7.4 Inventory-aware scheduling and origin seeding
 
-The sender never guesses window sizes — it executes the receiver's ranges —
-and never needs to know which packets were lost: retransmitting the last
-range is safe (receiver dedups), and if the receiver has moved on it re-sends
-its current range (nudge), which the sender adopts.
+The peer scheduler reconciles queued work against the current rolling
+manifest, prioritizes the newest entries, and keeps a per-segment tried set.
+Source selection is tiered:
 
-### 7.3 Convergence
+1. peers whose fresh inventory positively confirms the requested segment;
+2. the bootstrap/master when its fresh inventory confirms it;
+3. unknown candidates only when no authoritative fresh source exists.
 
-Every loss case converges because the receiver re-states its intent on every
-datagram and every quiet period, while the sender re-sends its last range on
-ack timeout:
+Fresh negative inventory and exact `SEGMENT_NOT_FOUND` answers suppress a peer
+for 15 seconds. Temporary `SEGMENT_NOT_READY` responses remove the source
+from the tried set and retry after a five-second source cooldown. The master
+retains the origin as an authoritative recovery path.
 
-- **content loss** → quiet period → same range re-requested → filled → advance
-- **ACK loss** → sender ack timeout → resend → receiver nudge → new range
-- **COMPLETE loss** → sender ack timeout → resend → receiver re-sends
-  COMPLETE (grace period) → sender frees
+For each segment the master normally admits at most two viable origin seeders
+(`QSTREAM_ORIGIN_SEEDERS=2`). Existing leases remain valid, stale/absent
+seeders can be replaced, and a safety check admits a recovery seed when no
+other reachable peer has a fresh positive copy. The bounded origin policy is
+intended to fan new segments through the overlay rather than make every peer
+pull every live-edge segment from the master.
 
-### 7.4 Pacing & settings
+### 7.5 Peer ranking and accounting
 
-| Setting                     | Value | Meaning                                |
-|-----------------------------|-------|----------------------------------------|
-| `SEGMENT_PACKET_SIZE`       | 1400  | bytes per content packet               |
-| `INITIAL_WINDOW`            | 5     | first range size                       |
-| `MAX_WINDOW`                | 64    | largest range size                     |
-| `PACE_INTERVAL_MS`          | 1     | min spacing between packets (deadline-paced, non-blocking) |
-| `WINDOW_QUIET_MS`           | 150   | receiver quiet period before ACKing    |
-| `FIRST_RESPONSE_TIMEOUT_MS` | 2000  | give up if nothing arrives             |
-| `WINDOW_RETRY_LIMIT`        | 8     | receiver re-request limit              |
-| `ACK_RETRY_LIMIT`           | 8     | sender resend limit                    |
-| `MAX_CONCURRENT_TRANSFERS`  | 16    | per-node transfer registry bound       |
-| `COMPLETE_GRACE_MS`         | 2000  | keep done transfers to re-ACK COMPLETE |
-| `PEERLIST_POLL_INTERVAL_MS` | 5000  | peer asks bootstrap for the peer list  |
-| `PEER_TTL_MS`               | 600000| evict idle peers from the registry     |
-| `MAX_PARALLEL_DOWNLOADS`    | 4     | concurrent segment downloads           |
-| `MAX_INFLIGHT_PER_PEER`     | 2     | concurrent pulls per peer              |
+Each peer starts at score 50. Successful pulls add 2, no-response timeouts
+subtract 10, and other failures subtract 3, clamped to 0–100. Definitive
+NOT_FOUND responses are tracked but do not penalize the score because they
+represent availability churn, not bad service. A peer is evicted after three
+consecutive unresponsive pulls. `/peers` exposes ranking, path freshness,
+inventory, transfer counts, latency, and directional payload bytes.
 
-Pacing is the throughput limiter: 1 packet/ms ≈ 11 Mbps ceiling, ample for a
-1 Mbps HLS stream. Env overrides: `QSTREAM_PACING_MS`, `QSTREAM_QUIET_MS`.
-
-### 7.5 Node internals
-
-Each node runs one recv loop on its single socket. Incoming datagrams are
-routed by transfer id to a per-transfer state machine; transfers expose their
-next deadline and the loop's read timeout is the minimum of all deadlines, so
-a single thread drives every transfer. Non-transfer messages (handshake,
-manifest) are handled inline.
-
-The transfer registry is bounded (`MAX_CONCURRENT_TRANSFERS`); failed,
-complete and timed-out transfers are evicted. Filenames are validated to
-reject path traversal (no `/`, `\`, leading `.`, control characters).
-
-### 7.6 Job queue & peer selection (M3, ranking M5)
-
-Missing segments from the manifest become jobs in a queue. The peer runs up
-to `MAX_PARALLEL_DOWNLOADS` downloads concurrently, one receiver per job:
-
-- **Peer selection (M5):** each peer carries a quality score (start 50;
-  +2 per successful pull, −1 per `SEGMENT_NOT_FOUND`, −10 per no-response,
-  −3 other failures; clamped 0..100). Candidates are weighted by
-  `score/(inflight+1)` and picked by weighted random draw, with the
-  bootstrap scored at 0.85× so peers take over the load as they prove
-  themselves. New (unproven) peers start at 50 — benefit of the doubt.
-- **Retry:** a failed job (timeout / `SEGMENT_NOT_FOUND`) is retried with
-  another untried peer; when all peers are exhausted the job rests in a
-  `FAIL_RETRY_COOLDOWN_MS = 5000` cooldown before the next manifest sync
-  re-queues it.
-- **Dead-peer eviction (M5):** a receiver that never gets a first response
-  counts an "unresponsive hit"; only after `EVICT_AFTER_UNRESPONSIVE = 3`
-  consecutive hits is the peer evicted. One bad moment (dropped request,
-  burst) is forgiven; a pattern is not.
-- **Ranking visibility (M5):** every node logs `peer ranking:` once a
-  minute and serves `GET /peers` (scores, pulls/serves, failures, latency)
-  over its HTTP port.
-
-### 7.7 Adaptive timers (M5)
-
-Real links don't have fixed RTTs, so the fixed quiet/ack constants were
-replaced with estimates that adapt to what a transfer actually observes:
-
-- **Receiver quiet period** = max(150 ms, 3 × EWMA(inter-packet gap) + 50 ms)
-  × 2^backoff (cap 8 s). A delayed link spaces packets out; without this the
-  receiver would treat the gaps as loss and burn its retry budget. Backoff
-  grows on each re-request and resets on any new packet, so a drop burst
-  spreads its retries across the outage instead of exhausting them mid-way.
-- **Sender ack timeout** = max(base(count), 2 × EWMA(measured RTT) + 150 ms),
-  with exponential backoff (×1.6 per retry, cap 8 s) and a `SENDER_RETRY_LIMIT
-  = 30` budget that deliberately outlives the receiver's, so a stalled window
-  can recover from the sender side too.
-- **Request resend:** if no first packet arrives by half the
-  first-response timeout (4 s), the receiver resends the `SEGMENT_REQUEST`
-  with a fresh budget — a single dropped request costs ~2 s instead of 4 s.
-- **Retention:** `QSTREAM_RETENTION_SECS` (default 0 = off) keeps old
-  segments servable past the playlist edge — a viewer 3-4 s behind the live
-  edge (or recovering from a stall) still finds its segments. Old pieces are
-  pruned once they leave the playlist and exceed the window.
-
-### 7.8 Fault injection (M5)
-
-Every node can be given a sick link for testing, via env vars applied in the
-single outgoing-datagram choke point (`FaultInjector`, seeded SplitMix64):
-
-| Var | Effect |
-|---|---|
-| `QSTREAM_FAULT_DROP_PCT` | % of outgoing datagrams dropped |
-| `QSTREAM_FAULT_DUP_PCT` | % sent twice |
-| `QSTREAM_FAULT_DELAY_MS` | fixed one-way latency on outgoing |
-| `QSTREAM_FAULT_REORDER_PCT` | % of sends swapped with the next |
-| `QSTREAM_FAULT_BURST_EVERY_MS/DUR_MS` | periodic full-drop bursts |
-| `QSTREAM_FAULT_SEED` | RNG seed (0 = time) |
-
-Faults hit all datagram types (control + data), like a real bad link.
+The node also exposes `/stats` JSON and `/metrics` Prometheus text, including
+origin seed assignments/denials and per-peer downloaded/uploaded byte totals.
 
 ## 8. CLI
 
-```
-qstream server <port> <manifest-path> [http-port]                       # master/seed mode
-qstream peer <local-port> <remote-ip> <remote-port> [data-dir] [http-port]       # peer mode
+```text
+qstream server <port> <manifest-path> [http-port]
+qstream peer <local-port> <remote-ip> <remote-port> [data-dir] [http-port]
 qstream --help
 ```
 
-- `server <port> <manifest-path>` binds `0.0.0.0:<port>` and serves the
-  m3u8 playlist at `<manifest-path>` (validated at startup). Segments are
-  served from the manifest's directory (`dirname(manifest-path)`).
-- `peer <local-port> ...` binds `0.0.0.0:<local-port>` so peers can later be
-  reached by other peers on a known port. `[data-dir]` defaults to `./data`;
-  the synced manifest is written to `<data-dir>/live.m3u8`.
-- `[http-port]` (both modes, optional) starts the embedded HTTP server
-  (M4, §11) serving the node's directory — point an HLS player at it:
-  `ffplay http://127.0.0.1:<http-port>/live.m3u8 -live_start_index 0`.
-- `QSTREAM_LOG=error|warn|info|debug|trace` controls verbosity (default info).
+`server` binds `0.0.0.0:<port>`, validates the manifest path, and serves
+segments from its directory. `peer` binds `0.0.0.0:<local-port>`, writes its
+synchronized state below `[data-dir]` (default `./data`), and can start the
+embedded HTTP server. `QSTREAM_NAME` controls the display name.
 
 ## 9. Milestones
 
-| #  | Milestone                                        | Status |
-|----|--------------------------------------------------|--------|
-| M0 | Scaffold + UDP handshake (this spec, §5.3)       | ✅     |
-| M1 | Manifest exchange (poll + serve)                 | ✅     |
-| M2 | Segment transfer: receiver-driven windows, ACKs, reassembly | ✅     |
-| M3 | Peer discovery (PEERLIST) + job queue            | ✅     |
-| M4 | Live HLS integration (ffmpeg → segments → HTTP)  | ✅     |
-| M5 | Robustness: fault injection, adaptive timers, peer ranking, retention (§7.7-7.8) | ✅     |
-| M6 | Ideas backlog: master failover, TCP-ish pacing, stats dashboard, score exchange | ⏳     |
+| Milestone | Status |
+|---|---|
+| M0 scaffold + UDP handshake | ✅ |
+| M1 manifest exchange | ✅ |
+| M2 reliable receiver-driven segment transfer | ✅ |
+| M3 peer discovery + parallel job queue | ✅ |
+| M4 live HLS playback over embedded HTTP | ✅ |
+| M5 fault injection, adaptive timers, ranking, retention, inventory-aware scheduling, bounded parents/origin seeding | ✅ |
+| N1 endpoint observation and protocol v3 handshake/peerlist | ✅ |
+| N2 PING/PONG keep-alive and direct hole punching | ✅ |
+| N3 same-LAN beacon paths | ✅ |
+| N4 opportunistic UPnP-IGD mapping | ✅ |
+| M6 selective retransmission, pipelined windows, FEC, master failover, relay, and broader swarm scaling | ⏳ |
 
-## 10. Playback (M4)
+## 10. Playback and HTTP
 
-Playback is **out-of-band**: it uses plain HTTP, not the UDP protocol.
-Each node embeds a minimal std-only HTTP/1.1 static server (GET/HEAD,
-`Connection: close`, no ranges — just enough for a live HLS player) that
-serves its directory:
+Playback is out-of-band and uses plain HTTP, not the UDP protocol. Each node
+embeds a minimal `std`-only HTTP/1.1 server with GET/HEAD and
+`Connection: close`. It serves:
 
-- `GET /live.m3u8` — the manifest (`application/vnd.apple.mpegurl`)
-- `GET /seg_NNNN.ts` — segments (`video/mp2t`)
+- `GET /live.m3u8` — the raw/filtered manifest;
+- `GET /playback.m3u8` — the peer's holdback playlist when present;
+- `GET /seg_NNNN.ts` — a complete segment;
+- `GET /health` — plain `ok`;
+- `GET /peers` — human-readable ranking;
+- `GET /stats` — JSON statistics;
+- `GET /metrics` — Prometheus exposition.
 
-The peer's directory fills in as segments are pulled, so a player pointed
-at the peer watches the same stream, replicated over UDP. Security: only
-flat, validated filenames are served — no path traversal, no directory
-listing.
+Only flat validated filenames are served; there is no directory listing, path
+traversal, range support, authentication, or encryption. Point `ffplay` at
+`playback.m3u8` for peers and `live.m3u8` for a master.
 
-Play with:
+## 11. Testing strategy and known limits
 
-```
-ffplay http://127.0.0.1:<http-port>/live.m3u8 -live_start_index 0
-```
+- **Unit:** codec round trips, malformed headers/payloads, availability masks,
+  playlist filtering, filename validation, fault-injector behavior, and
+  scheduler/lease helpers.
+- **Loopback integration:** master plus multiple peers, rolling manifest,
+  peer discovery, shared segment delivery, restart recovery, and peer/master
+  kill scenarios are exercised by `scripts/`.
+- **Fault testing:** loss, delay, duplication, reordering, and burst scenarios
+  are recorded in [REPORT.md](REPORT.md).
+- **NAT testing:** `scripts/natlab.sh` exercises NATed master pulls,
+  same-LAN paths, cross-NAT paths, and fake UPnP verification. Its iptables
+  SNAT is port-preserving rather than a full true-symmetric NAT model.
+- **Playback:** embedded HTTP status/MIME/filtering behavior is covered by unit
+  tests and the lab's curl/player checks.
 
-A `[http-port]` argument on both modes enables it. Future work: HTTP range
-requests (for seeking), request logging at info level.
-
-## 11. Testing strategy
-
-- **Unit:** codec round-trips (encode/decode every message), malformed
-  header rejection (bad magic/version/truncation), length edge cases;
-  packetize/assemble round-trips (out of order, duplicates, partial last
-  packet).
-- **Integration:** master + peer on loopback; assert handshake outcome,
-  peer list contents, and that the peer's synced manifest tracks the
-  master's rolling playlist (sequence numbers advance in lockstep); a
-  requested segment arrives byte-identical.
-- **Discovery (M3):** master + 2-3 peers on loopback — peers discover each
-  other via peerlists + mutual handshakes, pull from multiple sources, and
-  keep byte-identical data dirs; chain bootstrap (peer2 → peer1 → master)
-  works; killing a peer mid-transfer triggers retry via remaining peers
-  and eviction of the unresponsive peer.
-- **Playback (M4):** each node's embedded HTTP server serves the manifest
-  with the right MIME type and byte-identical segments; `ffprobe` and
-  `ffplay` consume the playlist from master and peer; 404 for missing
-  files, 405 for non-GET, traversal attempts rejected.
-- **Fault injection (M2+):** test harness that drops/duplicates/reorders
-  packets via an env var, to validate window/retry logic.
-- **E2E (M4+):** ffmpeg-generated HLS → master → 2 peers → `ffplay` playback
-  of all three nodes.
+Known architectural limits are deliberate: whole-window retransmission is
+expensive under uniform loss, one-window-at-a-time flow control is RTT-bound,
+master failure stops new content, direct symmetric-NAT pairs need a relay, and
+bounded peerlists are not a DHT. These are the primary M6 directions.
