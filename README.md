@@ -84,15 +84,22 @@ local playback and operational inspection.
 cargo test
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
+python3 scripts/test_suite.py
 ```
 
 Unit tests cover codecs, malformed datagrams, playlist filtering, scheduling
-helpers, fault injection, and transfer helpers. The `scripts/` labs exercise
-loopback swarms, packet loss/delay/duplication/reordering, peer and master
-failure, restart recovery, and a netns/iptables NAT matrix. The NAT lab uses
-port-preserving SNAT rather than a full true-symmetric NAT emulator; symmetric
-NAT pairs without a stable reachable endpoint still require a relay, which is
-not implemented.
+helpers, fault injection, and transfer helpers. The deterministic integration
+suite in `scripts/test_suite.py` starts real release binaries against a
+synthetic HLS origin and verifies HTTP health/playback, traversal rejection,
+byte-for-byte replication, peer-to-peer sharing, and recovery under a seeded
+5% loss link. It uses temporary directories and dynamically reserved localhost
+ports, so it does not depend on tmux, ffmpeg, the checked-in live playlist, or
+sudo. The longer `scripts/` labs additionally exercise loopback swarms, packet
+loss/delay/reordering, peer and master failure, restart recovery, and a
+netns/iptables NAT matrix. The NAT lab uses port-preserving SNAT rather than a
+full true-symmetric NAT emulator; symmetric NAT pairs without a stable
+reachable endpoint still require a relay, which is not implemented.
 
 ## Protocol document
 

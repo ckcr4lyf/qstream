@@ -364,10 +364,15 @@ traversal, range support, authentication, or encryption. Point `ffplay` at
 
 - **Unit:** codec round trips, malformed headers/payloads, availability masks,
   playlist filtering, filename validation, fault-injector behavior, and
-  scheduler/lease helpers.
-- **Loopback integration:** master plus multiple peers, rolling manifest,
-  peer discovery, shared segment delivery, restart recovery, and peer/master
-  kill scenarios are exercised by `scripts/`.
+  scheduler/lease helpers (`cargo test`).
+- **Deterministic integration:** `python3 scripts/test_suite.py` builds a
+  synthetic HLS origin, starts real release binaries with temporary directories
+  and dynamically reserved localhost ports, then verifies HTTP health/playback,
+  traversal rejection, byte-for-byte replication, peer-to-peer sharing, and
+  seeded 5% loss recovery. It does not require tmux, ffmpeg, the checked-in
+  live playlist, or sudo.
+- **Loopback/lab integration:** the longer scripts exercise rolling manifests,
+  peer discovery, restart recovery, and peer/master kill scenarios.
 - **Fault testing:** loss, delay, duplication, reordering, and burst scenarios
   are recorded in [REPORT.md](REPORT.md).
 - **NAT testing:** `scripts/natlab.sh` exercises NATed master pulls,

@@ -355,3 +355,38 @@ pulls in a 57-second interval: 17 from `183.178.210.60:4447`, 6 from
 remained distinct after the duplicate-name identity fix. The master reported
 130 seed assignments and 170 temporary denials at the sample point; those
 origin denials did not become VPS-2 definitive missing-segment failures.
+
+## Deterministic integration suite (2026-08-21) — IMPLEMENTED
+
+The repository now has `scripts/test_suite.py`, a self-contained integration
+suite that starts the real `target/release/qstream` binary instead of mocking
+protocol components. It creates a synthetic HLS origin in a temporary
+workspace, reserves localhost UDP/TCP ports dynamically, disables UPnP, and
+manages child process groups directly without tmux, ffmpeg, or sudo.
+
+The suite currently verifies:
+
+- master `/health` and peer playback HTTP endpoints;
+- flat filename/path-traversal rejection;
+- byte-for-byte SHA-256 integrity for zero-byte, boundary-sized, and multi-window
+  segments;
+- manifest synchronization and complete replication to a peer;
+- peer-to-peer sharing: a second peer must pull at least one segment from the
+  first peer while the master uses one origin seed lease;
+- deterministic 5% outgoing datagram loss using `QSTREAM_FAULT_SEED=424242`,
+  followed by byte-for-byte recovery of all segments.
+
+The command is:
+
+```sh
+cargo build --release
+python3 scripts/test_suite.py
+```
+
+Initial development found a real bug: zero-byte segments were written as a
+1400-byte file because the receiver treated `final_size == 0` as malformed.
+The receiver now preserves a valid empty final packet. Three consecutive suite
+runs passed after the fix, each covering 10 shared-origin segments, peer
+sharing, and 7 loss-injected segments. Failure artifacts are retained in
+`/tmp/qstream-test-suite-*`; pass runs clean up automatically, and `--keep`
+keeps the workspace for inspection.

@@ -515,7 +515,9 @@ impl ReceiverTransfer {
                 final_size = pos + payload.len();
             }
         }
-        if final_size == 0 || final_size > buffer.len() {
+        // A zero-byte segment is valid: its single packet has an empty
+        // payload, so `final_size == 0` must not be treated as malformed.
+        if final_size > buffer.len() {
             final_size = buffer.len();
         }
 
